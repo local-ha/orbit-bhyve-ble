@@ -1,0 +1,71 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "B-Hyve account",
+        "description": "Sign in with your Orbit B-Hyve cloud account. The integration uses cloud only at setup time to fetch device IDs and network keys, then talks to each timer over BLE — no cloud round trip after setup.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "pick_devices": {
+        "title": "Discovered devices",
+        "description": "Found {count} device(s). Uncheck any you don't want HA to manage.",
+        "data": {
+          "include": "Devices to add"
+        }
+      },
+      "reauth_confirm": {
+        "title": "B-Hyve — re-authenticate",
+        "description": "Your saved Orbit credentials no longer authenticate. Enter the password again.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password.",
+      "cannot_connect": "Cannot reach the Orbit cloud API. Check your network connection.",
+      "no_devices": "Login succeeded but no devices were found on this account.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "An account is already configured.",
+      "reauth_successful": "Re-authentication successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "B-Hyve options",
+        "data": {
+          "default_duration_sec": "Default watering duration (seconds)",
+          "idle_disconnect_sec": "Disconnect after idle (seconds)",
+          "poll_idle_sec": "State polling interval — idle (seconds)",
+          "poll_watering_sec": "State polling interval — watering (seconds)"
+        }
+      }
+    }
+  },
+  "services": {
+    "start_watering": {
+      "name": "Start watering",
+      "description": "Start watering on a specific zone for a given duration.",
+      "fields": {
+        "duration": {
+          "name": "Duration",
+          "description": "How long to water, in seconds."
+        }
+      }
+    },
+    "stop_all": {
+      "name": "Stop all",
+      "description": "Stop all watering on the targeted device."
+    },
+    "refresh_devices": {
+      "name": "Refresh devices from cloud",
+      "description": "Re-query the Orbit cloud for new/changed devices and updated network keys."
+    }
+  }
+}

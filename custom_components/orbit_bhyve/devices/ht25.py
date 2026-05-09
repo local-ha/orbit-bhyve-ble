@@ -1,0 +1,148 @@
+"""HT25-0000 (single-station hose-tap) device class.
+
+d7-47 protocol family. Verified against fw0085 (Deck) 2026-05-03 and
+fw0041 (Hill) 2026-05-05 — same protocol, the 2-byte frame prefix is the
+device's own mesh_device_id in little-endian (Deck's old "D747_MAGIC"
+constant was just Deck's mesh_id 18391 = 0x47D7 LE).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+
+from ..connection import BHyveBleConnection
+from .base import BHyveBleDeviceBase
+
+_LOGGER = logging.getLogger(__name__)
+
+D747_ROUTING = 0x40
+SEQ_BIND = 0x05
+SEQ_STATUS = 0x02
+SEQ_INFO = 0x03
+SEQ_SUBSYSTEM = 0x01
+SEQ_MAGIC_CHECK = 0x00
+SEQ_HEARTBEAT = 0x09
+SEQ_WATER_CTRL = 0x0D
+
+INIT_INTER_STEP_SEC = 0.15
+
+BIND_TAIL = bytes.fromhex("f66910ff")
+
+# Empirical hub mesh_device_id per network key. The cloud /api/networks
+# response doesn't surface ble_device_id for hubs in our wizard cache, so
+# magic2 (which references the paired hub) needs this fallback. Values
+# captured from phone-app BTSnoop logs:
+#   Topology A (Deck, Hub Guest BR):    hub mesh_id 0xEB42 = 60226
+#   Topology B (Hill, Corner, Hub Garage): hub mesh_id 0x233D = 9021
+_HUB_MESH_BY_NETWORK_KEY = {
+    "f0983e39083a335644614ffb3bd67ee4": 0xEB42,
+    "bcd2ff1a23290e00482ee1d0d4376a95": 0x233D,
+}
+
+
+class BHyveHT25Device(BHyveBleDeviceBase):
+    """HT25 single-station timer."""
+
+    frame_magic = 0x10
+    trailer_const = 0x10
+
+    @property
+    def mesh_address(self) -> bytes:
+        """The 2-byte device-address prefix on every command frame.
+        It's the device's own mesh_device_id, little-endian."""
+        if self.mesh_device_id is None:
+            raise RuntimeError(
+                f"{self.mac}: mesh_device_id missing from cloud record — "
+                "cannot build HT25 frames"
+            )
+        return self.mesh_device_id.to_bytes(2, "little")
+
+    @property
+    def hub_mesh_address(self) -> bytes:
+        """The 2-byte hub-address embedded in the magic2 init step."""
+        hub_id = self.hub_mesh_device_id
+        if hub_id is None:
+            hub_id = _HUB_MESH_BY_NETWORK_KEY.get(self.network_key.lower(), 0)
+        return hub_id.to_bytes(2, "little")
+
+    def _build(self, type_byte: int, seq: int, payload: bytes = b"") -> bytes:
+        return self.mesh_address + bytes([type_byte & 0xFF, seq & 0xFF, D747_ROUTING]) + payload
+
+    def _build_start(self, type_byte: int, duration_sec: int) -> bytes:
+        if not 0 < duration_sec <= 0xFFFF:
+            raise ValueError(f"duration_sec out of range (1..65535): {duration_sec}")
+        payload = bytes([0x04]) + duration_sec.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+        return self._build(type_byte, SEQ_WATER_CTRL, payload)
+
+    def _build_stop(self, type_byte: int) -> bytes:
+        return self._build(type_byte, SEQ_WATER_CTRL, b"\x02\x00\x00\x00")
+
+    async def _post_handshake(self, conn: BHyveBleConnection) -> None:
+        """8-step init the phone runs after the AES handshake. Sending the
+        watering command without it produces a silent drop. Only `bind`,
+        `status`, and `info` are confirmed required; the others may be
+        prunable but are kept for safety until empirically tested."""
+        sid = os.urandom(2)
+        # fw0041 (Hill, BTSnoop 2026-05-05): bind sid=0x48fd → rebind sid=0x48ff = +2.
+        # fw0085 has its own pre-fix code path in ht25_fw0085.py — don't add
+        # firmware branching here.
+        sid2 = ((int.from_bytes(sid, "little") + 2) & 0xFFFF).to_bytes(2, "little")
+
+        # magic1 payload: 0x01 || self mesh_id LE || 4 zero bytes
+        # magic2 payload: 0x00 || hub  mesh_id LE || 4 zero bytes
+        magic1_payload = b"\x01" + self.mesh_address + b"\x00\x00\x00\x00"
+        magic2_payload = b"\x00" + self.hub_mesh_address + b"\x00\x00\x00\x00"
+
+        steps: list[tuple[bytes, str]] = [
+            (self._build(0x81, SEQ_BIND, sid + BIND_TAIL), "bind"),
+            (self._build(0x02, SEQ_STATUS, b"\x00"), "status"),
+            (self._build(0x03, SEQ_INFO, b"\x00" * 7), "info"),
+            (self._build(0x04, SEQ_SUBSYSTEM, b"\x00" * 3), "subsystem"),
+            (self._build(0x85, SEQ_MAGIC_CHECK, magic1_payload), "magic1"),
+            (self._build(0x85, SEQ_MAGIC_CHECK, magic2_payload), "magic2"),
+            (self._build(0x85, SEQ_HEARTBEAT, b"\x00"), "heartbeat"),
+            (self._build(0x86, SEQ_BIND, sid2 + BIND_TAIL), "rebind"),
+        ]
+        for plaintext, label in steps:
+            _LOGGER.debug("%s: init → %s pt=%s", self.mac, label, plaintext.hex())
+            # _write_locked, not send_raw — we're already inside conn's lock
+            # (post-handshake hook runs from _open() called by send()).
+            await conn._write_locked(plaintext)
+            await asyncio.sleep(INIT_INTER_STEP_SEC)
+        await asyncio.sleep(0.3)
+
+    async def start_watering(self, station: int, duration_sec: int) -> bool:
+        if self.connection is None:
+            return False
+        # HT25 is single-station; `station` is a no-op placeholder for API parity.
+        plaintext = self._build_start(0xB6, duration_sec)
+        notifs = await self.connection.send(plaintext, drain_ms=1500)
+        _LOGGER.debug("%s: START got %d notifications", self.mac, len(notifs))
+        self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
+        if notifs:
+            self.state.is_watering = True
+            self.state.active_zone = station
+            self.state.seconds_remaining = duration_sec
+        return bool(notifs)
+
+    async def stop_watering(self, station: int | None = None) -> bool:
+        if self.connection is None:
+            return False
+        plaintext = self._build_stop(0xB7)
+        notifs = await self.connection.send(plaintext, drain_ms=1500)
+        _LOGGER.debug("%s: STOP got %d notifications", self.mac, len(notifs))
+        self._stamp_command("stop", len(notifs))
+        if notifs:
+            self.state.is_watering = False
+            self.state.active_zone = None
+            self.state.seconds_remaining = None
+        return bool(notifs)
+
+    async def refresh_state(self):
+        """Probe the device for an idle/watering status. Best-effort: the
+        watering-status response byte layout isn't fully decoded, so we only
+        update is_connected here. Local optimism (set in start/stop) drives
+        is_watering until full status decoding lands."""
+        await super().refresh_state()
+        return self.state

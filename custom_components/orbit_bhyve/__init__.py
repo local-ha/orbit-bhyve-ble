@@ -1,0 +1,233 @@
+"""Orbit B-Hyve BLE integration — account-level setup.
+
+Discovers all devices on an Orbit account, instantiates a per-device class
+based on hardware/firmware, and creates entity platforms. Cloud is touched
+only at setup time and on user-triggered refresh; runtime is BLE-only.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import voluptuous as vol
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from .cloud import CloudAuthError, CloudConnectionError, OrbitCloudClient
+from .const import (
+    CONF_DEFAULT_DURATION,
+    CONF_DEVICES,
+    CONF_EMAIL,
+    CONF_IDLE_DISCONNECT,
+    CONF_PASSWORD,
+    CONF_POLL_IDLE,
+    CONF_POLL_WATERING,
+    DEFAULT_DURATION,
+    DEFAULT_IDLE_DISCONNECT,
+    DEFAULT_POLL_IDLE,
+    DEFAULT_POLL_WATERING,
+    DOMAIN,
+)
+from .coordinator import BHyveDeviceCoordinator
+from .devices import UnsupportedModel, build_device
+
+_LOGGER = logging.getLogger(__name__)
+
+PLATFORMS: list[Platform] = [Platform.VALVE, Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
+
+
+class EntryRuntime:
+    """Lives at hass.data[DOMAIN][entry_id]."""
+
+    def __init__(self):
+        self.coordinators: dict[str, BHyveDeviceCoordinator] = {}  # cloud_id → coordinator
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    devices = entry.data.get(CONF_DEVICES, [])
+    if not devices:
+        _LOGGER.warning("%s: no devices in config entry", entry.entry_id)
+        return False
+
+    opts = entry.options
+    idle_disconnect = opts.get(CONF_IDLE_DISCONNECT, DEFAULT_IDLE_DISCONNECT)
+    poll_idle = opts.get(CONF_POLL_IDLE, DEFAULT_POLL_IDLE)
+    poll_watering = opts.get(CONF_POLL_WATERING, DEFAULT_POLL_WATERING)
+
+    runtime = EntryRuntime()
+    for record in devices:
+        # Skip hubs even if a stale entry from before the bridge filter
+        # still has them in CONF_DEVICES. Going forward they're filtered
+        # at cloud.discover() and never reach here.
+        if (record.get("type") or "").lower() == "bridge":
+            continue
+        try:
+            device = build_device(hass, record, idle_disconnect_sec=idle_disconnect)
+        except UnsupportedModel as err:
+            _LOGGER.warning("%s: %s — skipping", record.get("name"), err)
+            continue
+        coord = BHyveDeviceCoordinator(
+            hass, device, poll_idle_sec=poll_idle, poll_watering_sec=poll_watering,
+        )
+        # Don't await first refresh — many BHyve timers deep-sleep and would
+        # block setup while we wait for them. Coordinators self-update.
+        runtime.coordinators[record["cloud_id"]] = coord
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = runtime
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    _register_services(hass)
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    runtime: EntryRuntime | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if runtime:
+        for coord in runtime.coordinators.values():
+            await coord.device.async_unload()
+
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+    return unload_ok
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload entry when options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+def _register_services(hass: HomeAssistant) -> None:
+    if hass.services.has_service(DOMAIN, "refresh_devices"):
+        return
+
+    async def refresh_devices(call: ServiceCall) -> None:
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            email = entry.data.get(CONF_EMAIL)
+            password = entry.data.get(CONF_PASSWORD)
+            if not (email and password):
+                continue
+            client = OrbitCloudClient(async_get_clientsession(hass))
+            try:
+                discovered = await client.discover(email, password)
+            except CloudAuthError as err:
+                _LOGGER.error("Refresh: auth failed for %s: %s", email, err)
+                raise ConfigEntryAuthFailed(str(err)) from err
+            except CloudConnectionError as err:
+                _LOGGER.error("Refresh: cloud unreachable for %s: %s", email, err)
+                continue
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_DEVICES: discovered},
+            )
+            await hass.config_entries.async_reload(entry.entry_id)
+
+    hass.services.async_register(
+        DOMAIN, "refresh_devices", refresh_devices, schema=vol.Schema({}),
+    )
+
+    async def start_watering(call: ServiceCall) -> None:
+        duration = call.data.get("duration", DEFAULT_DURATION)
+        from homeassistant.helpers.entity_platform import async_get_platforms
+        for platform in async_get_platforms(hass, DOMAIN):
+            for entity in platform.entities.values():
+                if entity.entity_id in call.data.get("entity_id", []):
+                    await entity.async_open_valve(duration=duration)
+
+    hass.services.async_register(
+        DOMAIN,
+        "start_watering",
+        start_watering,
+        schema=vol.Schema({
+            vol.Required("entity_id"): cv.entity_ids,
+            vol.Optional("duration", default=DEFAULT_DURATION):
+                vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
+        }),
+    )
+
+    async def stop_all(call: ServiceCall) -> None:
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            runtime: EntryRuntime | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+            if not runtime:
+                continue
+            for coord in runtime.coordinators.values():
+                if coord.device.connection is None:
+                    continue
+                try:
+                    await coord.device.stop_watering()
+                except Exception as err:
+                    _LOGGER.warning("stop_all on %s: %s", coord.device.name, err)
+
+    hass.services.async_register(
+        DOMAIN, "stop_all", stop_all, schema=vol.Schema({}),
+    )
+
+    async def probe_magic(call: ServiceCall) -> None:
+        """Debug-only: override frame_magic + trailer_const on a device's
+        BLE connection and force-disconnect so the next command goes through
+        a fresh handshake using the new values. Used to test whether fw0041
+        devices use a different inner-protocol magic byte (e.g. 0x11) than
+        fw0085's 0x10. Persists only until HA restart."""
+        mac = call.data["mac"].upper()
+        magic = int(call.data["magic"]) & 0xFF
+        found = False
+        for runtime in hass.data.get(DOMAIN, {}).values():
+            for coord in runtime.coordinators.values():
+                if (coord.device.mac or "").upper() != mac:
+                    continue
+                conn = coord.device.connection
+                if conn is None:
+                    _LOGGER.warning("probe_magic: %s has no BLE connection (hub?)", mac)
+                    return
+                _LOGGER.warning(
+                    "probe_magic: %s magic 0x%02x→0x%02x, trailer 0x%02x→0x%02x; forcing reconnect",
+                    mac, conn._frame_magic, magic, conn._trailer_const, magic,
+                )
+                conn._frame_magic = magic
+                conn._trailer_const = magic
+                await conn.disconnect()
+                found = True
+        if not found:
+            _LOGGER.warning("probe_magic: no device with mac=%s", mac)
+
+    hass.services.async_register(
+        DOMAIN,
+        "probe_magic",
+        probe_magic,
+        schema=vol.Schema({
+            vol.Required("mac"): str,
+            vol.Required("magic"): vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
+        }),
+    )
+
+    async def probe_status(call: ServiceCall) -> None:
+        """Force a fresh BLE connect + 8-step init on the named device, no
+        actuation. connection._on_notify already decrypts and logs every
+        plaintext at INFO, so the captured init responses land in
+        `docker logs hass`. Used to gather data for offline byte-by-byte
+        battery decoding."""
+        mac = call.data["mac"].upper()
+        for runtime in hass.data.get(DOMAIN, {}).values():
+            for coord in runtime.coordinators.values():
+                if (coord.device.mac or "").upper() != mac:
+                    continue
+                conn = coord.device.connection
+                if conn is None:
+                    _LOGGER.warning("probe_status: %s has no BLE connection", mac)
+                    return
+                _LOGGER.warning("probe_status: %s — forcing reconnect", mac)
+                await conn.disconnect()
+                await conn.ensure_connected()
+                return
+        _LOGGER.warning("probe_status: no device with mac=%s", mac)
+
+    hass.services.async_register(
+        DOMAIN,
+        "probe_status",
+        probe_status,
+        schema=vol.Schema({vol.Required("mac"): str}),
+    )

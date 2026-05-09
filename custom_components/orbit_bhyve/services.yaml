@@ -1,0 +1,43 @@
+start_watering:
+  name: Start watering
+  description: Start watering on a specific zone for a given duration.
+  target:
+    entity:
+      integration: orbit_bhyve
+      domain: valve
+  fields:
+    duration:
+      name: Duration
+      description: How long to water, in seconds.
+      required: false
+      example: 300
+      default: 600
+      selector:
+        number:
+          min: 1
+          max: 65535
+          unit_of_measurement: seconds
+          mode: box
+
+stop_all:
+  name: Stop all
+  description: Stop all watering on the targeted device.
+  target:
+    device:
+      integration: orbit_bhyve
+
+refresh_devices:
+  name: Refresh devices from cloud
+  description: Re-query the Orbit cloud for new/changed devices and updated network keys. Manual; no background polling.
+
+probe_status:
+  name: Probe device status (debug)
+  description: Force a fresh BLE connect + 8-step init on a device. No actuation. Decoded plaintext lands in the HA log via connection._on_notify. Used for protocol decoding work (e.g., finding battery bytes).
+  fields:
+    mac:
+      name: MAC address
+      description: Device MAC, e.g. 44:67:55:52:99:01.
+      required: true
+      example: "44:67:55:52:99:01"
+      selector:
+        text:
