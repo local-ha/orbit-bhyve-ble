@@ -1,17 +1,19 @@
 """Generate brand artwork for the Orbit B-Hyve BLE integration.
 
-Run: ``python3 assets/generate_icons.py`` (regenerates all four PNGs in place).
+Run: ``python3 assets/generate_icons.py`` — writes all four PNGs to
+``custom_components/orbit_bhyve/brand/``.
 
-Outputs (sibling to this script):
+Outputs:
   icon.png       256x256
   icon@2x.png    512x512
   logo.png       256x128
   logo@2x.png    512x256
 
-The same files, copied to ``custom_integrations/orbit_bhyve/`` in
-home-assistant/brands, are what HACS and the HA UI render. No HA tooling
-reads from this repo's ``assets/`` directory; it only exists so the
-artwork is reproducible.
+Home Assistant 2026.3+ reads brand icons directly from each custom
+integration's ``brand/`` directory (see
+https://developers.home-assistant.io/blog/2026/02/24/brands-proxy-api),
+so those PNGs are shipped inside the integration; this script just
+keeps them reproducible.
 """
 
 from __future__ import annotations
@@ -21,7 +23,12 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-OUT_DIR = Path(__file__).resolve().parent
+OUT_DIR = (
+    Path(__file__).resolve().parent.parent
+    / "custom_components"
+    / "orbit_bhyve"
+    / "brand"
+)
 
 GRADIENT_TOP = (14, 116, 144, 255)     # #0E7490
 GRADIENT_BOTTOM = (34, 211, 238, 255)  # #22D3EE
