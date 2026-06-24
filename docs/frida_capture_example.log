@@ -1,0 +1,35 @@
+     ____
+    / _  |   Frida 17.9.1 - A world-class dynamic instrumentation toolkit
+   | (_| |
+    > _  |   Commands:
+   /_/ |_|       help      -> Displays the help system
+   . . . .       object?   -> Display information about 'object'
+   . . . .       exit/quit -> Exit
+   . . . .
+   . . . .   More info at https://frida.re/docs/home/
+   . . . .
+   . . . .   Connected to Android Tablet (id=<TABLET_SERIAL>)
+Attaching...
+[*] Hooking BluetoothGatt...
+[*] writeCharacteristic overloads: 1
+  0: Landroid/bluetooth/BluetoothGattCharacteristic;
+[*] All hooks installed. Waiting for BLE writes...
+[Android-Tablet::PID::XXXXX ]-> [BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=20 data=11103b7ae2c969d6c71c5ecb733e46dee7db9303
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=20 data=11106486ddd1f0724b5964d2281242c50f0d6f03
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=10 data=1106359176045d2e6801
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=20 data=1110ef85ca440262d598e91e96f8060e8b5e9905
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=16 data=110c94f7cd74ce3de5681080fd185209
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=14 data=110ad2572f049b2d1f3095f51303
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=15 data=110b788220fd33d44170e01eecf203
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=15 data=110bd1af8bc9703167fe731bd81b04
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=17 data=110d3dcb26d915cf51b0b6588f4969cf02
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=17 data=110daf89605c8e7476bd8fa725402ffc02
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=20 data=1110ec18a1ee2cd5a7196ed8eb0f0d86512c9303
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=20 data=11101e6297f4d5cf07724942a10cb92f7fe67203
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=10 data=1106898e9db7ac24b202
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=20 data=1110c1273764b7a006ad4469e385e92a7cfb9d05
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=16 data=110ce448ac29d680274ba49f5da7ba08
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=25 data=11153f1c3d4efacee8aa04921f2a979c76b5ec5e677cd78004
+[BLE-WRITE] UUID=00006c72-fe32-4f58-8b78-98e42b2c047f len=18 data=110e98eb6f6c64bfdd29a23ef92fb6028003
+
+Thank you for using Frida!

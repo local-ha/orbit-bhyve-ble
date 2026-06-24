@@ -1,0 +1,8 @@
+# Core dependencies for the standalone CLI and exploration scripts.
+# The Home Assistant integration declares its own requirements in manifest.json.
+
+bleak>=0.21.0
+bleak-retry-connector>=3.0.0
+cryptography>=41.0.0
+requests>=2.31.0
+paho-mqtt>=1.6.1

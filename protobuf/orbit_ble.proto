@@ -1,0 +1,87 @@
+// Reconstructed Protocol Buffer interface description for the
+// Orbit B-Hyve XD Bluetooth hose-timer BLE data channel.
+//
+// This file is a RECONSTRUCTED interface description, built from observed
+// wire-level traffic and behavioral testing against a device the project
+// authors lawfully own. It is not a copy of any vendor source and is not a
+// complete schema. Field numbers, wire types, and named messages have been
+// validated by encoding messages from this schema and observing the device
+// respond as expected.
+//
+// Field names where the vendor's exact name was not observable from public
+// APIs are descriptive-English approximations chosen for clarity.
+//
+// See ../docs/encryption.md for the cipher and frame format that this
+// schema rides inside, and ../README.md for the project context.
+
+syntax = "proto2";
+
+package orbit;
+
+// Top-level IPC message sent over BLE
+message IpcMsg {
+  optional BleInitMsg       bleInitMsg      = 1;
+  optional bool             enterBootloader = 2;
+  optional BleBridgedDevices bleBridgedDevices = 3;
+  // ... other fields ...
+  repeated BleBridgedMsg    bleBridgedMsgs  = 87;
+}
+
+// Authentication / initialization message
+// Must be sent first before any commands are accepted
+message BleInitMsg {
+  optional bytes  bdAddress  = 1;  // Device MAC address (6 bytes)
+  optional bytes  networkKey = 2;  // Authentication key — UNKNOWN SOURCE
+  optional uint32 advertType = 3;
+  optional uint32 deviceSn   = 4;
+}
+
+// BLE bridge message wrapper
+message BleBridgedMsg {
+  optional BlePhyInterface phyInterface = 1;
+  optional BleDeviceId     deviceId     = 2;
+  optional uint32          deviceSn     = 3;
+
+  oneof devSpecific {
+    BleDevSpec_IrrigationTimer irrigationTimer = 10;
+    BleDevSpec_FloodSensor     floodSensor     = 11;
+    BleDevSpec_RawData         rawData         = 12;
+  }
+}
+
+// Irrigation timer device specifics — valve control lives here
+message BleDevSpec_IrrigationTimer {
+  optional uint32           currentTimeSecEpochLocal = 1;
+  optional WateringStatus   wateringStatus           = 2;
+  optional SetRainDelay     rainDelay                = 3;
+  optional DeviceStatus     deviceStatus             = 4;
+  optional uint32           nextStartProgramFlags    = 5;
+  optional uint32           nextStartTimeSecEpochUTC = 6;
+}
+
+// BLE bridge commands
+message BleBridgedCmd {
+  optional BlePhyInterface phyInterface = 1;
+  optional BleDeviceId     deviceId     = 2;
+  optional uint32          deviceSn     = 3;
+
+  oneof message {
+    bool             bleBridgedCmdDisconnect    = 10;
+    UpdateFw         bleBridgedCmdUpdateFw      = 11;
+    bool             bleBridgedCmdIdentify      = 12;
+    OtaUpdateStart   bleBridgedCmdOtaUpdateStart = 13;
+    bool             bleBridgedCmdAckAlarm      = 20;
+  }
+}
+
+// Placeholder messages (details not yet recovered)
+message BlePhyInterface {}
+message BleDeviceId {}
+message WateringStatus {}
+message SetRainDelay {}
+message DeviceStatus {}
+message BleBridgedDevices {}
+message UpdateFw {}
+message OtaUpdateStart {}
+message BleDevSpec_FloodSensor {}
+message BleDevSpec_RawData {}

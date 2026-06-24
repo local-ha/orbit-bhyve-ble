@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  bhyve-bridge:
+    build: .
+    container_name: bhyve-ble-bridge
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    volumes:
+      - /run/dbus:/run/dbus:ro
+    environment:
+      - MQTT_BROKER=<mqtt_broker>
+      - MQTT_PORT=1883
+      - MQTT_USER=<your_mqtt_user>
+      - MQTT_PASS=<your_mqtt_password>
+      - BHYVE_MAC=XX:XX:XX:XX:XX:XX
+      - BHYVE_KEY=<YOUR_NETWORK_KEY_HEX>
+      - BHYVE_DURATION=600
+      - BHYVE_ZONES=4
+      - BLE_ADAPTER=hci1

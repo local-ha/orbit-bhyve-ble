@@ -1,3 +1,4 @@
+# --- Home Assistant integration (ljmerza upstream) ---
 __pycache__/
 *.pyc
 *.pyo
@@ -10,3 +11,35 @@ venv/
 .vscode/
 *.swp
 .DS_Store
+
+# --- CLI / research tooling (local-ha integration line) ---
+# Python build/dist
+build/
+dist/
+*.egg
+.eggs/
+
+# Local config / secrets — never commit these
+config.local.json
+config.json
+*.local.yaml
+.env
+secrets.yaml
+.bhyve_config.json
+.bhyve_config*.json
+/scripts/.bhyve_config.json
+
+# Local-only working brief + machine-specific configs
+/CLAUDE.md
+/.mcp.json
+
+# Captures & logs (may contain device-specific data)
+*.btsnoop
+*.pcap
+*.pcapng
+captures/
+logs/
+
+# Build artifacts
+*.zip
+release_build/
