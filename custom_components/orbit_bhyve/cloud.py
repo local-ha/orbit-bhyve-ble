@@ -103,7 +103,16 @@ class OrbitCloudClient:
             raise CloudConnectionError(str(err)) from err
 
     async def get_mesh(self, mesh_id: str) -> dict[str, Any]:
-        """Try /meshes/<id> first; fall back to legacy paths on 404."""
+        """Try /meshes/<id> first; fall back to the other paths on 401/403/404.
+
+        A 401/403 here is NOT an expired session: login and /devices already
+        succeeded with this token before get_mesh runs, so an auth-style
+        rejection means the endpoint simply doesn't apply to this account's
+        schema (newer-schema accounts return 401 for /meshes and serve keys
+        from /network_topologies). Treat it like 404 and try the next path,
+        rather than aborting discovery — which config_flow would otherwise
+        surface to the user as "invalid email or password".
+        """
         last_status = None
         for path_tmpl in CLOUD_KEY_PATHS:
             path = path_tmpl.format(mesh_id=mesh_id)
@@ -114,10 +123,8 @@ class OrbitCloudClient:
                     headers=self._headers(),
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
-                    if resp.status == 401:
-                        raise CloudAuthError("session expired")
-                    if resp.status == 404:
-                        last_status = 404
+                    if resp.status in (401, 403, 404):
+                        last_status = resp.status
                         continue
                     resp.raise_for_status()
                     return await resp.json()
