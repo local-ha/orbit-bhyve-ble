@@ -11,6 +11,7 @@ when the WAN goes down.
 |-------------------|----------------|------------------|------------------------------------------|
 | Hose-tap timer    | `HT25-0000`    | `0085`           | ✅ Actuated end-to-end                   |
 | Hose-tap timer    | `HT25-0000`    | `0041`           | ✅ Actuated end-to-end (per-device mesh-ID addressing) |
+| Hose-tap timer (Gen2) | `HT25G2-0001` | `0111`          | ✅ Actuated end-to-end (protobuf protocol) |
 | 4-port XD         | `HT34A-0001`   | `0107`           | ✅ Actuated end-to-end (community-verified) |
 
 > ⚠️ **Do NOT update your B-Hyve device firmware.** This integration was
