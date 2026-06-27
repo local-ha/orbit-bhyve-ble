@@ -16,6 +16,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
+from .devices.base import _mv_to_pct
 
 
 async def async_setup_entry(
@@ -27,10 +28,14 @@ async def async_setup_entry(
     entities: list[SensorEntity] = []
     for coord in runtime.coordinators.values():
         device = coord.device
-        if device.battery_pct is not None:
-            entities.append(BHyveBatterySensor(coord))
-        if device.battery_mv is not None:
-            entities.append(BHyveBatteryVoltageSensor(coord))
+        # Every BLE device reports battery over RX; create both sensors so the
+        # percent entity exists regardless of whether the cloud snapshot
+        # happened to include a pct (the XD reports mv-only). Hubs / key-less
+        # records have no BLE connection and no battery to read.
+        if device.connection is None:
+            continue
+        entities.append(BHyveBatterySensor(coord))
+        entities.append(BHyveBatteryVoltageSensor(coord))
     async_add_entities(entities)
 
 
@@ -63,7 +68,12 @@ class BHyveBatterySensor(_BHyveDeviceSensorBase):
 
     @property
     def native_value(self) -> int | None:
-        return self.coordinator.device.battery_pct
+        device = self.coordinator.device
+        if device.battery_pct is not None:
+            return device.battery_pct
+        if device.battery_mv is not None:
+            return _mv_to_pct(device.battery_mv)
+        return None
 
 
 class BHyveBatteryVoltageSensor(_BHyveDeviceSensorBase):
