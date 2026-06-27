@@ -10,7 +10,9 @@ Cipher (verified against 257 captured frames + actuated commands):
   TX counter = uint32_LE(init_tx[12:16]); RX counter = init_tx[16:20].
   Frame = [magic][len][ciphertext (len bytes)][trailer u16_LE].
   Trailer = sum(plaintext) + trailer_const + len.
-WRITE_REQ (response=True) is required — WRITE_CMD is silently dropped.
+Commands use WRITE_REQ (response=True) for its ATT delivery ack; char 6c72 also
+advertises write-without-response, and both modes have been observed to actuate
+the HT34A, so WRITE_REQ is a safe default across device classes.
 """
 from __future__ import annotations
 

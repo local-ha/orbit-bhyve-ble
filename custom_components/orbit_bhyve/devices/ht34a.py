@@ -1,9 +1,9 @@
 """HT34A-0001 (4-port XD timer) device class.
 
-Ported from upstream `wxfield/Orbit_B-Hyve_4Port_Controller`. Not
-hardware-tested in this repo (account doesn't have an HT34A); cipher
-math is shared with HT25 so handshake is verified, but the inner
-plaintext + magic byte differences are the upstream's empirical work.
+Ported from upstream `wxfield/Orbit_B-Hyve_4Port_Controller` and
+community-verified against firmware 0107 (2026-06): zone start/stop
+actuate over BLE via Home Assistant, both through an ESPHome Bluetooth
+proxy and a direct adapter. Cipher math is shared with the HT25 family.
 """
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ _STOP_PB = bytes.fromhex("720408021200")
 
 
 class BHyveHT34ADevice(BHyveBleDeviceBase):
-    """4-port XD timer. Ported from upstream — not hardware-tested here."""
+    """4-port XD timer. Ported from upstream; verified on fw0107 over BLE."""
 
     frame_magic = 0x11
     trailer_const = 0x11
