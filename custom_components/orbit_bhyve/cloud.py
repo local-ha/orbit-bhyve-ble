@@ -15,6 +15,7 @@ from .const import (
     CLOUD_APP_ID,
     CLOUD_KEY_FIELDS,
     CLOUD_KEY_PATHS,
+    CLOUD_USER_AGENT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,7 +50,17 @@ class OrbitCloudClient:
         return self._user_id
 
     def _headers(self, *, include_auth: bool = True) -> dict[str, str]:
-        h = {"orbit-app-id": CLOUD_APP_ID}
+        # Orbit's WAF returns 403 to requests whose User-Agent contains
+        # "HomeAssistant" — which is exactly what HA's shared aiohttp session
+        # (async_get_clientsession) stamps on every request. Without an
+        # override, every cloud call here is forbidden and config_flow
+        # mislabels it "invalid email or password". Send a browser User-Agent
+        # (matching the wider B-Hyve HA ecosystem's fix) so setup works.
+        h = {
+            "orbit-app-id": CLOUD_APP_ID,
+            "User-Agent": CLOUD_USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+        }
         if include_auth and self._token:
             h["orbit-api-key"] = self._token
         return h
@@ -92,7 +103,16 @@ class OrbitCloudClient:
             raise CloudConnectionError(str(err)) from err
 
     async def get_mesh(self, mesh_id: str) -> dict[str, Any]:
-        """Try /meshes/<id> first; fall back to legacy paths on 404."""
+        """Try /meshes/<id> first; fall back to the other paths on 401/403/404.
+
+        A 401/403 here is NOT an expired session: login and /devices already
+        succeeded with this token before get_mesh runs, so an auth-style
+        rejection means the endpoint simply doesn't apply to this account's
+        schema (newer-schema accounts return 401 for /meshes and serve keys
+        from /network_topologies). Treat it like 404 and try the next path,
+        rather than aborting discovery — which config_flow would otherwise
+        surface to the user as "invalid email or password".
+        """
         last_status = None
         for path_tmpl in CLOUD_KEY_PATHS:
             path = path_tmpl.format(mesh_id=mesh_id)
@@ -103,10 +123,8 @@ class OrbitCloudClient:
                     headers=self._headers(),
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
-                    if resp.status == 401:
-                        raise CloudAuthError("session expired")
-                    if resp.status == 404:
-                        last_status = 404
+                    if resp.status in (401, 403, 404):
+                        last_status = resp.status
                         continue
                     resp.raise_for_status()
                     return await resp.json()
