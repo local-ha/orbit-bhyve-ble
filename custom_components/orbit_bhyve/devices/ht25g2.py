@@ -23,6 +23,7 @@ import logging
 
 from .base import BHyveBleDeviceBase
 from .ht34a import _STOP_PB, _build_message, _build_start_pb
+from .status import apply_status_plaintext
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +33,10 @@ class BHyveHT25G2Device(BHyveBleDeviceBase):
 
     frame_magic = 0x11
     trailer_const = 0x11
+
+    def _observe_plaintext(self, pt: bytes) -> None:
+        # Protobuf-family status decode (live battery + real watering state).
+        apply_status_plaintext(self, pt)
 
     async def start_watering(self, station: int, duration_sec: int) -> bool:
         if self.connection is None:
