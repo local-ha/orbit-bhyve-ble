@@ -23,12 +23,20 @@ import struct
 from collections.abc import Awaitable, Callable
 
 from bleak import BleakClient
+from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .const import AES_CHAR, READ_CHAR, WRITE_CHAR
 
 _LOGGER = logging.getLogger(__name__)
+
+# A connect can succeed on a weak/proxy link while the post-connect handshake
+# (subscribe + AES write/read) stalls with no natural timeout — wedging the
+# pooled connection for ~30s and leaking it. Bound the handshake and retry the
+# whole open, disconnecting between tries; healthy links pass on attempt 1.
+HANDSHAKE_TIMEOUT_SEC = 10.0
+OPEN_MAX_ATTEMPTS = 3
 
 PostHandshakeHook = Callable[["BHyveBleConnection"], Awaitable[None]]
 PlaintextObserver = Callable[[bytes], None]
@@ -95,10 +103,36 @@ class BHyveBleConnection:
         if ble_device is None:
             raise BleNotConnectable(f"{self.mac}: not in range of any connectable BLE adapter")
 
-        _LOGGER.debug("%s: connecting", self.mac)
-        self._client = await establish_connection(BleakClient, ble_device, self.mac, max_attempts=3)
-        _LOGGER.debug("%s: connected", self.mac)
+        last_err: Exception | None = None
+        for attempt in range(1, OPEN_MAX_ATTEMPTS + 1):
+            try:
+                _LOGGER.debug("%s: connecting (attempt %d/%d)", self.mac, attempt, OPEN_MAX_ATTEMPTS)
+                self._client = await establish_connection(
+                    BleakClient, ble_device, self.mac, max_attempts=3
+                )
+                _LOGGER.debug("%s: connected", self.mac)
+                # Bound the handshake: on a marginal link the connect succeeds
+                # but the GATT exchange below can hang indefinitely.
+                await asyncio.wait_for(self._handshake(), timeout=HANDSHAKE_TIMEOUT_SEC)
+            except (asyncio.TimeoutError, BleakError, OSError, BleHandshakeError) as err:
+                last_err = err
+                _LOGGER.debug(
+                    "%s: open attempt %d/%d failed: %s", self.mac, attempt, OPEN_MAX_ATTEMPTS, err
+                )
+                await self.disconnect()  # clean slate so the retry gets a fresh GATT window
+                continue
+            # Handshake succeeded — run the per-device-class init, then we're open.
+            if self._post_handshake_hook is not None:
+                await self._post_handshake_hook(self)
+            return
 
+        raise BleHandshakeError(
+            f"{self.mac}: open failed after {OPEN_MAX_ATTEMPTS} attempts: {last_err}"
+        )
+
+    async def _handshake(self) -> None:
+        """Subscribe + AES session init. Bounded by the caller; on a marginal
+        link any of these GATT ops can stall, so it must run under wait_for."""
         # Note: tried writing the provisioning frame [0x01 0x00 || key] to
         # NETWORK_CHAR (0x6c76) here — char is firmware-locked on every
         # device tested ("Write not permitted"). Confirmed not the actual
@@ -123,23 +157,6 @@ class BHyveBleConnection:
         self._rx_ctr = struct.unpack("<I", buf[16:20])[0]
         self._handshaken = True
         _LOGGER.debug("%s: handshake ok, iv=%s tx_ctr=0x%08x", self.mac, self._iv.hex(), self._tx_ctr)
-
-        # One-shot GATT enumeration — looking for standard Battery Service
-        # (0x180F / 0x2A19) or anything else the device exposes that we
-        # haven't been using.
-        try:
-            for service in self._client.services:
-                _LOGGER.info("%s: gatt svc %s", self.mac, service.uuid)
-                for char in service.characteristics:
-                    _LOGGER.info(
-                        "%s:   char %s props=%s",
-                        self.mac, char.uuid, list(char.properties),
-                    )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("%s: gatt enum failed: %s", self.mac, err)
-
-        if self._post_handshake_hook is not None:
-            await self._post_handshake_hook(self)
 
     def _on_notify(self, _sender, data) -> None:
         """Bleak notification callback. Buffers the raw frame for the
