@@ -11,6 +11,7 @@ import logging
 import struct
 
 from .base import BHyveBleDeviceBase
+from .status import apply_status_plaintext
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,6 +67,11 @@ class BHyveHT34ADevice(BHyveBleDeviceBase):
 
     frame_magic = 0x11
     trailer_const = 0x11
+
+    def _observe_plaintext(self, pt: bytes) -> None:
+        # Protobuf-family status decode (live battery + real watering state),
+        # not the d7-47 mesh battery parse the base class does.
+        apply_status_plaintext(self, pt)
 
     async def start_watering(self, station: int, duration_sec: int) -> bool:
         if self.connection is None:
