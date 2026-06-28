@@ -167,10 +167,11 @@ behaviorally cross-checked against the operator's action log**, not vendor-confi
 | **Request status** | `#15 {}` (empty) | Elicits a full `#16` status burst — **works mid-run** (the dependable poll the old TODO wanted). |
 | **Set clock (timestamp-sync)** | `#18 { #1 = "YYYY-MM-DDThh:mm:ss±hh:mm" }` | ISO-8601 local string; sent on connect. Benign liveness check. |
 | **Set / clear rain delay** | `#17 { #1=minutes; #3=expiryUnixUTC; #4=1 }` | `minutes=0` clears. `expiry = deviceClock + minutes·60`. Confirmed 1440=24 h, 2880=48 h. |
-| **Create / edit program** | `#19 { … }` | Full schema below. |
+| **Create / edit / replace program** | `#19 { … }` | Write the full program to its slot (`#1`). **Replace** = write the replacement's content to the target slot — no special opcode. Full schema below. |
+| **Delete program** | `#19 { #1=slot; #17=name; #10/#14/#15/#16/#21; *no* #8, *no* #9 }` | A slot write stripped of start times (`#8`) and zone durations (`#9`) clears the slot. Confirmed deleting two programs (slots A and C). |
 | **Subscribe / poll status (flow)** | `#57 { #1=intervalMs; #2=type }` | `#1=1000` → device streams periodic `#59` ~1/s; used by the flow screen. (Gen2.) |
-| Program-slot action (tentative) | `#20 { #1=n }` | Small command seen around program create/name/delete; op encoding TBD (delete/replace/select). |
-| Connect-time queries (unconfirmed) | `#75 {#1=unixTs; #2=mask}`, `#120 {#1: empty}`, device-info request → RX `#23` | Sent during handshake; exact purpose TBD. |
+| Program commit/refresh | `#20 { #1=n }` | Small follow-up after a program write (`n` varies 8/9/12/13) — a list version/commit, not the core op. |
+| Connect-time queries | `#15 {}`, `#22 {}`, `#45 {}`, `#120 {}` (empty), `#18` clock, `#75 {#1=unixTs; #2=mask}`, `#19` reads of existing programs, device-info → RX `#23` | Sent during the handshake to sync clock + read current state. |
 
 ### Watering program message (`#19`)
 
@@ -178,7 +179,7 @@ Captured by editing one advanced program (name `OurAdvancedProgram`) through eve
 
 | Field | Meaning | Observed |
 |---|---|---|
-| `#1` | program **slot id** | A=`1`, B=`2` (Gen2) |
+| `#1` | program **slot id** | A=`1`, B=`2`, C=`3`, D=`4` |
 | `#8` (repeated varint) | **start times**, minutes-of-day | `360` (06:00), `1080` (18:00) |
 | `#9 { #1=zoneIndex; #2=runSec }` (repeated) | **per-zone run durations** | Z0=300, Z1=420, Z2=540, Z3=660 (5/7/9/11 min) |
 | `#10` | budget / seasonal-adjust % | `100` |

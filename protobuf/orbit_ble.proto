@@ -101,8 +101,8 @@ message OrbitBleMessage {
   optional DeviceStatus    deviceStatus   = 16;  // RX device state block
   optional SetRainDelay    rainDelay      = 17;  // TX set/clear rain delay
   optional SetClock        setClock       = 18;  // TX timestamp-sync (ISO-8601 string)
-  optional WateringProgram program        = 19;  // TX/RX program create/edit/read
-  optional ProgramAction   programAction  = 20;  // TX small slot action (delete/replace?) TBD
+  optional WateringProgram program        = 19;  // TX/RX program create/edit/replace/delete/read
+  optional ProgramCommit   programCommit  = 20;  // TX small follow-up after a program write
   optional DeviceInfo      deviceInfo     = 23;  // RX model / firmware
   optional BatteryReport   batteryReport  = 46;  // RX standalone battery
   optional StatusSubscribe statusSubscribe = 57; // TX poll/subscribe -> periodic #59
@@ -146,7 +146,7 @@ message WateringStatus {           // #59, emitted periodically after StatusSubs
   optional uint32 active      = 1;  // 0 = not watering
   optional uint32 flowRateGpm = 3;  // flow sensor reading (Gen2; 0 when dry)
 }
-message ProgramAction { optional uint32 op = 1; }  // TX #20; op encoding TBD
+message ProgramCommit { optional uint32 n = 1; }  // TX #20 list version/commit after a write
 
 message DeviceInfo {
   optional uint32 kind     = 1;
@@ -155,8 +155,10 @@ message DeviceInfo {
 }
 
 // Watering program (slots A–D). Exactly one of the day-mode fields is set.
+// Create/edit/replace = write the full message to slotId. Delete = write with
+// name + metadata but NO startTimesMin and NO zoneRunTimes (clears the slot).
 message WateringProgram {
-  optional uint32          slotId        = 1;
+  optional uint32          slotId        = 1;   // A=1, B=2, C=3, D=4
   optional WeekdayMask     weekdays      = 3;   // specific weekdays
   optional IntervalSchedule everyNDays   = 4;   // every N days
   optional EmptyMarker     oddDays       = 5;   // odd calendar days
