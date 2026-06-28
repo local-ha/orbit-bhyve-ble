@@ -168,7 +168,9 @@ behaviorally cross-checked against the operator's action log**, not vendor-confi
 | **Set clock (timestamp-sync)** | `#18 { #1 = "YYYY-MM-DDThh:mm:ss±hh:mm" }` | ISO-8601 local string; sent on connect. Benign liveness check. |
 | **Set / clear rain delay** | `#17 { #1=minutes; #3=expiryUnixUTC; #4=1 }` | `minutes=0` clears. `expiry = deviceClock + minutes·60`. Confirmed 1440=24 h, 2880=48 h. |
 | **Create / edit program** | `#19 { … }` | Full schema below. |
-| Connect-time queries (unconfirmed) | `#20 {#1=0}`, `#75 {#1=unixTs; #2=mask}`, `#120 {#1: empty}`, device-info request → RX `#23` | Sent during handshake; exact purpose TBD. |
+| **Subscribe / poll status (flow)** | `#57 { #1=intervalMs; #2=type }` | `#1=1000` → device streams periodic `#59` ~1/s; used by the flow screen. (Gen2.) |
+| Program-slot action (tentative) | `#20 { #1=n }` | Small command seen around program create/name/delete; op encoding TBD (delete/replace/select). |
+| Connect-time queries (unconfirmed) | `#75 {#1=unixTs; #2=mask}`, `#120 {#1: empty}`, device-info request → RX `#23` | Sent during handshake; exact purpose TBD. |
 
 ### Watering program message (`#19`)
 
@@ -176,7 +178,7 @@ Captured by editing one advanced program (name `OurAdvancedProgram`) through eve
 
 | Field | Meaning | Observed |
 |---|---|---|
-| `#1` | program slot id | `1` |
+| `#1` | program **slot id** | A=`1`, B=`2` (Gen2) |
 | `#8` (repeated varint) | **start times**, minutes-of-day | `360` (06:00), `1080` (18:00) |
 | `#9 { #1=zoneIndex; #2=runSec }` (repeated) | **per-zone run durations** | Z0=300, Z1=420, Z2=540, Z3=660 (5/7/9/11 min) |
 | `#10` | budget / seasonal-adjust % | `100` |
@@ -203,6 +205,24 @@ Captured by editing one advanced program (name `OurAdvancedProgram`) through eve
   carries run progress (`#5` total sec, `#7` remaining sec, `#6{…}`).
 - **`#19` program** is echoed back on read/save (start times re-emitted as `#8 { #45 = value }`).
 - **`#30`** small command ack around start/stop/clear.
+- **`#59` watering/flow status:** `{ #1=active(0/1), #2=?, #3=flowRateGpm }` — emitted
+  periodically (~1/s) after a `#57` subscribe; `#3` carried `0` against the dry Gen2 (the app
+  showed "0 gpm / fault").
+
+### Gen2 (HT25G2) parity + flow (2026-06-28 re-capture)
+
+A Gen2 single-station valve (BTValve03, HT25G2-0001 fw `0111`) was driven through the same
+subset (`captures/20260628_app_full_surface/decoded_g2.txt`, 70/70 frames CRC-valid). The
+Gen2 uses a **different GATT handle layout** (notify on `0x0011`, not the XD's `0x0016`; the
+decoder resolves handles by ATT behavior), but the **application protocol is byte-identical**:
+
+- **Manual start** `#14{#1=2,#2{#3{#1=0,#2=120}}}`, **rain delay** `#17{#1=720(=12 h),…}`
+  (RX `#16.#1=3`), and **program** `#19{#1=2 (slot B), #5{} (odd), #8=185 (03:05), …}` all
+  match the XD encodings exactly — confirming one protocol across the HT34A/HT25G2 family.
+- **Flow sensor is Gen2-only.** The Gen2 answered the `#57` poll with live `#59` flow frames;
+  the XD exposed no flow path (matching the hardware — the XD has no flow sensor).
+- Pre-existing programs are **read back on connect** (e.g. RX `#19` "Tomatoes And Peppers",
+  even-days) — a basis for a future "get programs".
 
 ### Not observed over BLE (likely cloud-side attributes)
 

@@ -102,9 +102,11 @@ message OrbitBleMessage {
   optional SetRainDelay    rainDelay      = 17;  // TX set/clear rain delay
   optional SetClock        setClock       = 18;  // TX timestamp-sync (ISO-8601 string)
   optional WateringProgram program        = 19;  // TX/RX program create/edit/read
+  optional ProgramAction   programAction  = 20;  // TX small slot action (delete/replace?) TBD
   optional DeviceInfo      deviceInfo     = 23;  // RX model / firmware
   optional BatteryReport   batteryReport  = 46;  // RX standalone battery
-  optional WateringStatus  wateringStatus = 59;  // RX periodic watering flag
+  optional StatusSubscribe statusSubscribe = 57; // TX poll/subscribe -> periodic #59
+  optional WateringStatus  wateringStatus = 59;  // RX watering + flow status
 }
 
 message TimerMode {
@@ -135,7 +137,16 @@ message DeviceStatus {
 }
 message Battery { optional uint32 millivolts = 3; }
 message BatteryReport { optional Battery battery = 3; }  // #46 { #3 = mV } (standalone shape)
-message WateringStatus { optional uint32 active = 1; }   // 0 = not watering
+
+message StatusSubscribe {
+  optional uint32 intervalMs = 1;  // e.g. 1000 -> ~1 Hz #59 stream
+  optional uint32 type       = 2;  // selector (2 observed; flow/watering)
+}
+message WateringStatus {           // #59, emitted periodically after StatusSubscribe
+  optional uint32 active      = 1;  // 0 = not watering
+  optional uint32 flowRateGpm = 3;  // flow sensor reading (Gen2; 0 when dry)
+}
+message ProgramAction { optional uint32 op = 1; }  // TX #20; op encoding TBD
 
 message DeviceInfo {
   optional uint32 kind     = 1;
