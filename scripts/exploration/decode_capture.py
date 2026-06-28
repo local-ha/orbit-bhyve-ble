@@ -66,11 +66,6 @@ def _hex(val):
     return val.replace(":", "").replace(" ", "") if isinstance(val, str) else ""
 
 
-def _short_uuid(uuid128):
-    h = _hex(uuid128)
-    return h[4:8] if len(h) >= 8 else ""
-
-
 def _packets(path):
     """Yield (frame_no, time_abs, time_rel, flat_btatt) for every ATT packet."""
     for p in json.load(open(path)):
@@ -89,17 +84,43 @@ def _packets(path):
 
 
 def resolve_handles(packets):
-    """Map the three short UUIDs to value handles, by uuid128 if present else fallback."""
-    uuid_to_handle = {}
+    """Resolve the init / TX / RX value handles by ATT *behavior*, not UUID.
+
+    UUID-based mapping is unreliable: a characteristic's declaration and its
+    descriptors all carry the same 128-bit UUID, so the value handle is easily
+    confused with a neighbouring descriptor handle (seen on the Gen2 capture).
+    Behavior is unambiguous across devices/firmwares:
+      - RX   = the handle that emits notifications (0x1b).
+      - init = the read+write AES char (has a read response 0x0b; 20-byte writes).
+      - TX   = the highest-volume write handle that isn't init.
+    Falls back to the B-Hyve standard handles only if a role can't be observed.
+    """
+    from collections import Counter
+    notif, read_resp, writes, write20 = Counter(), Counter(), Counter(), Counter()
     for *_x, flat in packets:
+        op = flat.get("btatt.opcode")
         handle = flat.get("btatt.handle")
-        u128 = next((v for k, v in flat.items() if "uuid128" in k and isinstance(v, str)), None)
-        if handle and u128:
-            short = _short_uuid(u128)
-            if short in (U_INIT, U_TX, U_RX):
-                uuid_to_handle.setdefault(short, handle)
-    resolved = {u: uuid_to_handle.get(u, FALLBACK_HANDLES[u]) for u in (U_INIT, U_TX, U_RX)}
-    used_fallback = [u for u in (U_INIT, U_TX, U_RX) if u not in uuid_to_handle]
+        if not handle:
+            continue
+        vlen = len(_hex(flat.get("btatt.value"))) // 2
+        if op == OP_NOTIFY:
+            notif[handle] += 1
+        elif op == OP_READ_RESP:
+            read_resp[handle] += 1
+        elif op in (OP_WRITE_REQ, OP_WRITE_CMD):
+            writes[handle] += 1
+            if vlen == 20:
+                write20[handle] += 1
+
+    h_rx = notif.most_common(1)[0][0] if notif else None
+    h_init = max(read_resp, key=lambda h: (write20[h], read_resp[h]), default=None)
+    tx_cands = {h: c for h, c in writes.items() if h != h_init}
+    h_tx = max(tx_cands, key=tx_cands.get, default=None)
+
+    resolved = {U_INIT: h_init, U_TX: h_tx, U_RX: h_rx}
+    used_fallback = [u for u, v in resolved.items() if v is None]
+    for u in used_fallback:
+        resolved[u] = FALLBACK_HANDLES[u]
     return resolved, used_fallback
 
 
@@ -262,7 +283,7 @@ def main():
     packets = list(_packets(args.json))
     handles, fallback = resolve_handles(packets)
     print(f"handles: {handles}"
-          + (f"  (fallback for: {', '.join(fallback)})" if fallback else "  (resolved by UUID)"))
+          + (f"  (fallback for: {', '.join(fallback)})" if fallback else "  (resolved by ATT behavior)"))
     sessions = split_sessions(packets, handles)
     print(f"{len(packets)} ATT packets -> {len(sessions)} BLE session(s)")
 
