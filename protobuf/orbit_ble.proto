@@ -77,11 +77,93 @@ message BleBridgedCmd {
 // Placeholder messages (details not yet recovered)
 message BlePhyInterface {}
 message BleDeviceId {}
-message WateringStatus {}
-message SetRainDelay {}
-message DeviceStatus {}
 message BleBridgedDevices {}
 message UpdateFw {}
 message OtaUpdateStart {}
 message BleDevSpec_FloodSensor {}
 message BleDevSpec_RawData {}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Device data-channel messages (6c72 TX / 6c73 RX), reconstructed from the
+// 2026-06-28 XD full-surface capture (HT34A-0001 fw0107). See
+// ../docs/ble_protocol.md "Capability Command Catalog" for evidence. These are
+// the messages actually observed on the wire; field names are descriptive.
+// ───────────────────────────────────────────────────────────────────────────
+
+// The single wrapper every data-channel frame carries. Exactly one payload
+// field is set per message; its field number selects the type.
+message OrbitBleMessage {
+  optional bytes  bdAddress    = 1;   // device MAC (6 bytes), present on RX
+  optional uint32 deviceClock  = 7;   // Unix epoch seconds (RX)
+
+  optional TimerMode       timerMode      = 14;  // TX start/stop; RX active-run echo
+  optional StatusRequest   statusRequest  = 15;  // TX: empty -> elicits a status burst
+  optional DeviceStatus    deviceStatus   = 16;  // RX device state block
+  optional SetRainDelay    rainDelay      = 17;  // TX set/clear rain delay
+  optional SetClock        setClock       = 18;  // TX timestamp-sync (ISO-8601 string)
+  optional WateringProgram program        = 19;  // TX/RX program create/edit/read
+  optional DeviceInfo      deviceInfo     = 23;  // RX model / firmware
+  optional BatteryReport   batteryReport  = 46;  // RX standalone battery
+  optional WateringStatus  wateringStatus = 59;  // RX periodic watering flag
+}
+
+message TimerMode {
+  optional uint32       mode         = 1;  // 2 = manual
+  optional ManualParams manualParams = 2;  // empty => stop
+}
+message ManualParams { optional StationInfo stationInfo = 3; }
+message StationInfo {
+  optional uint32 stationId  = 1;  // zone - 1 (0..3 on the XD)
+  optional uint32 runTimeSec = 2;
+}
+
+message StatusRequest {}  // sent empty; works mid-run
+
+message SetRainDelay {
+  optional uint32 minutes      = 1;  // 0 = clear; 1440 = 24h; 2880 = 48h
+  optional uint32 expiryUnixUtc = 3;  // deviceClock + minutes*60
+  optional uint32 enabled      = 4;  // observed = 1
+}
+
+message SetClock { optional string localIso8601 = 1; }  // "YYYY-MM-DDThh:mm:ss±hh:mm"
+
+message DeviceStatus {
+  optional uint32       mode       = 1;   // 1=idle, 3=rain-delay, 4=manual running
+  optional TimerMode    activeRun  = 2;   // echo of the running manual command
+  optional SetRainDelay rainDelay  = 13;  // current rain-delay status (same shape as #17)
+  optional Battery      battery    = 14;  // { #3 = mV }
+}
+message Battery { optional uint32 millivolts = 3; }
+message BatteryReport { optional Battery battery = 3; }  // #46 { #3 = mV } (standalone shape)
+message WateringStatus { optional uint32 active = 1; }   // 0 = not watering
+
+message DeviceInfo {
+  optional uint32 kind     = 1;
+  optional string model    = 2;  // "HT34A-0001"
+  optional bytes  firmware = 3;  // packed fw digits
+}
+
+// Watering program (slots A–D). Exactly one of the day-mode fields is set.
+message WateringProgram {
+  optional uint32          slotId        = 1;
+  optional WeekdayMask     weekdays      = 3;   // specific weekdays
+  optional IntervalSchedule everyNDays   = 4;   // every N days
+  optional EmptyMarker     oddDays       = 5;   // odd calendar days
+  optional EmptyMarker     evenDays      = 6;   // even calendar days
+  repeated uint32          startTimesMin = 8;   // start times, minutes-of-day
+  repeated ZoneRunTime     zoneRunTimes  = 9;
+  optional uint32          budgetPct     = 10;  // seasonal adjust %
+  optional uint32          scheduleStart = 11;  // Unix; omit #12 (end) => "Never"
+  optional uint32          scheduleEnd   = 12;
+  optional string          name          = 17;
+}
+message WeekdayMask { optional uint32 bitmask = 1; }  // bit0=Sun .. bit6=Sat
+message IntervalSchedule {
+  optional uint32 n         = 1;  // every N days
+  optional string anchorIso = 2;  // ISO-8601 anchor date
+}
+message EmptyMarker {}
+message ZoneRunTime {
+  optional uint32 zoneIndex = 1;
+  optional uint32 runSec    = 2;
+}

@@ -141,6 +141,78 @@ TX** to elicit the burst rather than waiting for a volunteered push. The app's t
 message (see "Verifying Your Connection") is a known status-eliciting write and a good RE
 starting point; capture it and add it to the TX command catalog.
 
+## Capability Command Catalog (2026-06-28 XD full-surface app capture)
+
+Decoded from a single official-app session driving the XD 4-port (HT34A-0001, fw `0107`)
+with the Wi-Fi hub unplugged (forcing the local BLE path). Source artifacts:
+`captures/20260628_app_full_surface/` (notes repo) — `decoded_xd.txt` (156/156 frames
+CRC-valid) + the timestamped `action_log.md`. Decoder:
+`scripts/exploration/decode_capture.py`. Field semantics are **reconstructed and
+behaviorally cross-checked against the operator's action log**, not vendor-confirmed.
+
+> **Message framing note (CTR streaming).** Long inner messages are transmitted as
+> consecutive 16-byte CTR blocks, **each wrapped in its own `0x11|len|ct|trailer` outer
+> frame** (typically `len=0x10`), with the AES counter continuing across them. To decode,
+> strip each frame's header/trailer, concatenate the ciphertext per direction, and decrypt
+> as one continuous stream (see `decode_capture.py`). This supersedes the earlier "RX is
+> never fragmented" note — short replies fit one frame, but program/status payloads span
+> several.
+
+### TX commands (host→device, on `6c72`)
+
+| Capability | Protobuf (field tree) | Notes |
+|---|---|---|
+| **Start watering** | `#14 { #1=2; #2 { #3 { #1=stationId; #2=runTimeSec } } }` | `stationId = zone−1`; seconds. (Confirmed: zone1/60 s, zone3/120 s.) |
+| **Stop watering** | `#14 { #1=2; #2={} }` | `72 04 08 02 12 00`. |
+| **Request status** | `#15 {}` (empty) | Elicits a full `#16` status burst — **works mid-run** (the dependable poll the old TODO wanted). |
+| **Set clock (timestamp-sync)** | `#18 { #1 = "YYYY-MM-DDThh:mm:ss±hh:mm" }` | ISO-8601 local string; sent on connect. Benign liveness check. |
+| **Set / clear rain delay** | `#17 { #1=minutes; #3=expiryUnixUTC; #4=1 }` | `minutes=0` clears. `expiry = deviceClock + minutes·60`. Confirmed 1440=24 h, 2880=48 h. |
+| **Create / edit program** | `#19 { … }` | Full schema below. |
+| Connect-time queries (unconfirmed) | `#20 {#1=0}`, `#75 {#1=unixTs; #2=mask}`, `#120 {#1: empty}`, device-info request → RX `#23` | Sent during handshake; exact purpose TBD. |
+
+### Watering program message (`#19`)
+
+Captured by editing one advanced program (name `OurAdvancedProgram`) through every day-mode.
+
+| Field | Meaning | Observed |
+|---|---|---|
+| `#1` | program slot id | `1` |
+| `#8` (repeated varint) | **start times**, minutes-of-day | `360` (06:00), `1080` (18:00) |
+| `#9 { #1=zoneIndex; #2=runSec }` (repeated) | **per-zone run durations** | Z0=300, Z1=420, Z2=540, Z3=660 (5/7/9/11 min) |
+| `#10` | budget / seasonal-adjust % | `100` |
+| `#11` | schedule **start** date (Unix) | set |
+| `#12` | schedule **end** date (Unix) | present for a date; **omitted ⇒ "Never"** |
+| `#17` | program **name** (UTF-8) | `OurAdvancedProgram` |
+| `#14`,`#15`,`#16`,`#18`,`#21`,`#22` | enable/flags + date boundaries | small varints / midnight Unix ts |
+
+**Watering-days mode (mutually exclusive — exactly one present):**
+
+| Mode | Encoding | Evidence |
+|---|---|---|
+| Specific weekdays | `#3 { #1 = bitmask }`, **bit0=Sun … bit6=Sat** | all=`127`, Mon/Wed/Fri=`42` (bits 1,3,5) |
+| Every N days | `#4 { #1 = N; #2 = anchor ISO date }` | N=`3` |
+| Odd days | `#5 {}` (empty marker) | — |
+| Even days | `#6 {}` (empty marker) | — |
+
+### RX additions (device→host, on `6c73`)
+
+- **Run-state `#16.#1`:** extend the table to `1`=idle, **`3`=rain-delay active**, `4`=manual running.
+- **`#16.#13` rain-delay status:** `{ #1=minutes, #3=expiryUnix, #4=enabled(0/1) }` — echoes the
+  `#17` set command (idle shape is the shorter `{ #1=0, #4=0 }`).
+- **`#16.#2`** echoes the active manual run (`{#1=2, #2{#3{stationId,runSec}}}`); **`#16.#6`**
+  carries run progress (`#5` total sec, `#7` remaining sec, `#6{…}`).
+- **`#19` program** is echoed back on read/save (start times re-emitted as `#8 { #45 = value }`).
+- **`#30`** small command ack around start/stop/clear.
+
+### Not observed over BLE (likely cloud-side attributes)
+
+With the hub unplugged, two app actions produced **no BLE traffic**: the **zone rename**
+(`ZoneTESTalpha` never appears on the wire) and the **per-zone default manual run-time**
+(step 7). Treat these as cloud/account attributes, not local-BLE settable — confirm before
+promising them as local features. (Program *names* do transmit, so naming per se is not the
+blocker.) Smart-watering enable also failed in-app ("device has no internet connection"), so
+its enable path is likewise cloud-gated.
+
 ## Notes on Behavior
 
 - **No BLE bonding.** The device does not write to the host's `bt_config.conf` paired-devices table. It does not enforce link-layer pairing or LE Secure Connections.
