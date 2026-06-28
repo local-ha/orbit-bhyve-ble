@@ -38,6 +38,12 @@ _LOGGER = logging.getLogger(__name__)
 HANDSHAKE_TIMEOUT_SEC = 10.0
 OPEN_MAX_ATTEMPTS = 3
 
+# The device acks a command via NOTIFICATION, not an ATT Write Response. Over a
+# direct link the (unused) write response still arrives in <200ms, but over an
+# ESPHome BLE proxy it is never relayed — so a response=True write would block
+# ~30s. Cap the wait; the notification drain in send() is the real ack.
+WRITE_ACK_TIMEOUT_SEC = 0.8
+
 PostHandshakeHook = Callable[["BHyveBleConnection"], Awaitable[None]]
 PlaintextObserver = Callable[[bytes], None]
 
@@ -251,7 +257,17 @@ class BHyveBleConnection:
         post-handshake hook (which runs inside _open() inside the lock)."""
         frame = self.encrypt(plaintext)
         assert self._client is not None
-        await self._client.write_gatt_char(WRITE_CHAR, frame, response=True)
+        # WRITE_REQ (response=True) is required — the device drops Write Commands
+        # — but it answers via notification and some transports (the ESPHome
+        # proxy) never relay the ATT Write Response, which would block ~30s. Cap
+        # the wait; the notification drain in send() is the real ack.
+        try:
+            await asyncio.wait_for(
+                self._client.write_gatt_char(WRITE_CHAR, frame, response=True),
+                timeout=WRITE_ACK_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            pass
 
     async def send(self, plaintext: bytes, *, drain_ms: int = 1500) -> list[bytes]:
         """Encrypt + WRITE_REQ + drain notifications for `drain_ms`. Returns
@@ -272,6 +288,29 @@ class BHyveBleConnection:
         async with self._lock:
             await self.ensure_connected()
             await self._write_locked(plaintext)
+
+    async def send_actuation(self, plaintext: bytes, *, drain_ms: int = 1500) -> list[bytes]:
+        """Re-run the per-device init sequence, then send a command — atomically.
+
+        Some devices only honour a watering command in a freshly-initialised
+        session: a pooled connection's per-class bind/init goes stale, so the
+        command is ack'd but SILENTLY IGNORED (no actuation). Re-run the init
+        hook before the command rather than trusting the pooled session. For a
+        device class with no post-handshake hook this is just ensure_connected
+        + send."""
+        async with self._lock:
+            if self.is_connected and self._handshaken:
+                if self._post_handshake_hook is not None:
+                    await self._post_handshake_hook(self)  # refresh stale bind in place
+            else:
+                await self._open()  # cold — _open() already runs the init hook
+            self._notif_buf.clear()
+            await self._write_locked(plaintext)
+            await asyncio.sleep(drain_ms / 1000.0)
+            received = list(self._notif_buf)
+            self._notif_buf.clear()
+            self._arm_idle_timer()
+            return received
 
 
 class BleNotConnectable(Exception):

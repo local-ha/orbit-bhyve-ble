@@ -30,17 +30,6 @@ INIT_INTER_STEP_SEC = 0.15
 
 BIND_TAIL = bytes.fromhex("f66910ff")
 
-# Empirical hub mesh_device_id per network key. The cloud /api/networks
-# response doesn't surface ble_device_id for hubs in our wizard cache, so
-# magic2 (which references the paired hub) needs this fallback. Values
-# captured from phone-app BTSnoop logs:
-#   Topology A (Deck, Hub Guest BR):    hub mesh_id 0xEB42 = 60226
-#   Topology B (Hill, Corner, Hub Garage): hub mesh_id 0x233D = 9021
-_HUB_MESH_BY_NETWORK_KEY = {
-    "f0983e39083a335644614ffb3bd67ee4": 0xEB42,
-    "bcd2ff1a23290e00482ee1d0d4376a95": 0x233D,
-}
-
 
 class BHyveHT25Device(BHyveBleDeviceBase):
     """HT25 single-station timer."""
@@ -61,11 +50,10 @@ class BHyveHT25Device(BHyveBleDeviceBase):
 
     @property
     def hub_mesh_address(self) -> bytes:
-        """The 2-byte hub-address embedded in the magic2 init step."""
-        hub_id = self.hub_mesh_device_id
-        if hub_id is None:
-            hub_id = _HUB_MESH_BY_NETWORK_KEY.get(self.network_key.lower(), 0)
-        return hub_id.to_bytes(2, "little")
+        """The 2-byte hub-address embedded in the magic2 init step, from the
+        cloud record's hub mesh_device_id (0 when the cloud didn't surface it —
+        the device still binds; magic2 just carries a null hub reference)."""
+        return (self.hub_mesh_device_id or 0).to_bytes(2, "little")
 
     def _build(self, type_byte: int, seq: int, payload: bytes = b"") -> bytes:
         return self.mesh_address + bytes([type_byte & 0xFF, seq & 0xFF, D747_ROUTING]) + payload
@@ -85,9 +73,11 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         `status`, and `info` are confirmed required; the others may be
         prunable but are kept for safety until empirically tested."""
         sid = os.urandom(2)
-        # fw0041 (Hill, BTSnoop 2026-05-05): bind sid=0x48fd → rebind sid=0x48ff = +2.
-        # fw0085 has its own pre-fix code path in ht25_fw0085.py — don't add
-        # firmware branching here.
+        # Rebind sid offset. fw0041 (Hill, BTSnoop 2026-05-05) uses +2; the old
+        # hardcoded fw0085 (Deck) path used +3. All HT25 firmwares now route here
+        # with +2 and rely on start/stop's confirm-and-retry to recover loudly
+        # from any mismatch. If a fw0085 unit is shown (via BTSnoop) to require
+        # +3, parameterize this per firmware then.
         sid2 = ((int.from_bytes(sid, "little") + 2) & 0xFFFF).to_bytes(2, "little")
 
         # magic1 payload: 0x01 || self mesh_id LE || 4 zero bytes
@@ -113,37 +103,63 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             await asyncio.sleep(INIT_INTER_STEP_SEC)
         await asyncio.sleep(0.3)
 
+    async def _poll_watering(self) -> bool:
+        """Request a status frame and return the device's reported watering
+        state. The seq=0x02 reply is decoded in base._observe_plaintext, which
+        sets self.state.is_watering from the device's own mode byte."""
+        if self.connection is None:
+            return False
+        await self.connection.send(self._build(0x02, SEQ_STATUS, b"\x00"), drain_ms=700)
+        return self.state.is_watering
+
     async def start_watering(self, station: int, duration_sec: int) -> bool:
         if self.connection is None:
             return False
         # HT25 is single-station; `station` is a no-op placeholder for API parity.
+        # send_actuation re-runs the bind first — the device acks but silently
+        # ignores a watering command on a stale pooled session. Then confirm via
+        # a status poll; retry once with a fully fresh session.
         plaintext = self._build_start(0xB6, duration_sec)
-        notifs = await self.connection.send(plaintext, drain_ms=1500)
-        _LOGGER.debug("%s: START got %d notifications", self.mac, len(notifs))
-        self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
-        if notifs:
-            now = datetime.now(timezone.utc)
-            self.state.is_watering = True
-            self.state.active_zone = station
-            self.state.seconds_remaining = duration_sec
-            self.state.started_at = now
-            self.state.expected_off_at = now + timedelta(seconds=duration_sec)
-        return bool(notifs)
+        for attempt in range(2):
+            notifs = await self.connection.send_actuation(plaintext, drain_ms=1500)
+            self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
+            if await self._poll_watering():
+                now = datetime.now(timezone.utc)
+                self.state.active_zone = station
+                self.state.seconds_remaining = duration_sec
+                self.state.started_at = now
+                self.state.expected_off_at = now + timedelta(seconds=duration_sec)
+                _LOGGER.debug("%s: START confirmed watering", self.mac)
+                return True
+            _LOGGER.warning(
+                "%s: START acked but device not watering (attempt %d/2) — fresh session",
+                self.mac, attempt + 1,
+            )
+            await self.connection.disconnect()
+        _LOGGER.error("%s: START failed to actuate after retries", self.mac)
+        return False
 
     async def stop_watering(self, station: int | None = None) -> bool:
         if self.connection is None:
             return False
         plaintext = self._build_stop(0xB7)
-        notifs = await self.connection.send(plaintext, drain_ms=1500)
-        _LOGGER.debug("%s: STOP got %d notifications", self.mac, len(notifs))
-        self._stamp_command("stop", len(notifs))
-        if notifs:
-            self.state.is_watering = False
-            self.state.active_zone = None
-            self.state.seconds_remaining = None
-            self.state.started_at = None
-            self.state.expected_off_at = None
-        return bool(notifs)
+        for attempt in range(2):
+            notifs = await self.connection.send_actuation(plaintext, drain_ms=1500)
+            self._stamp_command("stop", len(notifs))
+            if not await self._poll_watering():
+                self.state.active_zone = None
+                self.state.seconds_remaining = None
+                self.state.started_at = None
+                self.state.expected_off_at = None
+                _LOGGER.debug("%s: STOP confirmed idle", self.mac)
+                return True
+            _LOGGER.warning(
+                "%s: STOP acked but device still watering (attempt %d/2) — fresh session",
+                self.mac, attempt + 1,
+            )
+            await self.connection.disconnect()
+        _LOGGER.error("%s: STOP failed to close after retries", self.mac)
+        return False
 
     async def refresh_state(self):
         """Probe the device for an idle/watering status. Best-effort: the

@@ -43,25 +43,40 @@ class BHyveHT25G2Device(BHyveBleDeviceBase):
             return False
         # Single-station device: wire station_id is 0-indexed (station 1 -> 0).
         plaintext = _build_message(_build_start_pb(station - 1, duration_sec))
-        notifs = await self.connection.send(plaintext, drain_ms=2000)
-        _LOGGER.debug("%s: HT25G2 START station=%d got %d notifications",
-                      self.mac, station, len(notifs))
-        self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
-        if notifs:
-            self.state.is_watering = True
-            self.state.active_zone = station
-            self.state.seconds_remaining = duration_sec
-        return bool(notifs)
+        # Confirm via the decoded status reply (set in self.state.is_watering by
+        # _observe_plaintext); retry once with a fresh session if not confirmed.
+        for attempt in range(2):
+            notifs = await self.connection.send(plaintext, drain_ms=2000)
+            self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
+            if self.state.is_watering:
+                self.state.active_zone = station
+                self.state.seconds_remaining = duration_sec
+                _LOGGER.debug("%s: HT25G2 START confirmed watering", self.mac)
+                return True
+            _LOGGER.warning(
+                "%s: HT25G2 START not confirmed (attempt %d/2) — fresh session",
+                self.mac, attempt + 1,
+            )
+            await self.connection.disconnect()
+        _LOGGER.error("%s: HT25G2 START failed to actuate after retries", self.mac)
+        return False
 
     async def stop_watering(self, station: int | None = None) -> bool:
         if self.connection is None:
             return False
         plaintext = _build_message(_STOP_PB)
-        notifs = await self.connection.send(plaintext, drain_ms=2000)
-        _LOGGER.debug("%s: HT25G2 STOP got %d notifications", self.mac, len(notifs))
-        self._stamp_command("stop", len(notifs))
-        if notifs:
-            self.state.is_watering = False
-            self.state.active_zone = None
-            self.state.seconds_remaining = None
-        return bool(notifs)
+        for attempt in range(2):
+            notifs = await self.connection.send(plaintext, drain_ms=2000)
+            self._stamp_command("stop", len(notifs))
+            if not self.state.is_watering:
+                self.state.active_zone = None
+                self.state.seconds_remaining = None
+                _LOGGER.debug("%s: HT25G2 STOP confirmed idle", self.mac)
+                return True
+            _LOGGER.warning(
+                "%s: HT25G2 STOP not confirmed (attempt %d/2) — fresh session",
+                self.mac, attempt + 1,
+            )
+            await self.connection.disconnect()
+        _LOGGER.error("%s: HT25G2 STOP failed to close after retries", self.mac)
+        return False

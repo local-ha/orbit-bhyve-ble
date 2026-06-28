@@ -101,28 +101,31 @@ class BHyveBleDeviceBase(abc.ABC):
         """Override to send per-class init frames after the AES handshake."""
 
     def _observe_plaintext(self, pt: bytes) -> None:
-        """Parse battery_mV out of every info-ack notification.
+        """Parse d7-47 mesh status replies: battery (seq 0x03) and watering
+        state (seq 0x02).
 
-        d7-47 frame layout: [mesh:2][type:1][seq:1][routing:1][payload:N].
-        seq=0x03 is the device-info command; the response (type byte has
-        the 0x40 reply bit set, routing=0x40) carries a 7-byte payload
-        whose bytes 4-5 are battery voltage as little-endian uint16.
-        Verified against fw0085 (Deck) and fw0041 (Hill, Corner) by
-        cross-checking with cloud snapshots: Hill 2601 vs 2602, Corner
-        2606 vs 2606, Deck May 2 sessions traced 2872→2835 mV (discharge)."""
-        if len(pt) < 12:
+        Frame layout: [mesh:2][type:1][seq:1][routing:1][payload:N]. Replies
+        set the 0x40 reply bit in the type byte and carry routing=0x40 (TX
+        echoes with the bit clear are skipped). Verified against fw0085 (Deck)
+        and fw0041 (Hill, Corner) cross-checked with cloud snapshots."""
+        if len(pt) < 6 or pt[4] != 0x40 or not (pt[2] & 0x40):
             return
-        if pt[3] != 0x03 or pt[4] != 0x40:
-            return
-        if not (pt[2] & 0x40):
-            # TX echoes (response bit clear) carry the same shape; skip.
-            return
-        mv = int.from_bytes(pt[9:11], "little")
-        if not 1500 <= mv <= 4000:
-            # Out-of-band — probably a malformed parse; don't poison state.
-            return
-        self.battery_mv = mv
-        self.battery_pct = _mv_to_pct(mv)
+        seq = pt[3]
+        if seq == 0x03 and len(pt) >= 12:
+            # Info-ack: payload bytes 4-5 (pt[9:11]) are battery mV, LE.
+            mv = int.from_bytes(pt[9:11], "little")
+            if 1500 <= mv <= 4000:  # out-of-band => malformed; don't poison state
+                self.battery_mv = mv
+                self.battery_pct = _mv_to_pct(mv)
+        elif seq == 0x02 and len(pt) >= 6:
+            # Status reply/push: payload[0] (pt[5]) is the watering mode —
+            # 0x04 = watering, 0x01 = idle. Authoritative device state, used to
+            # confirm an actuation actually took.
+            mode = pt[5]
+            if mode == 0x04:
+                self.state.is_watering = True
+            elif mode == 0x01:
+                self.state.is_watering = False
 
     @abc.abstractmethod
     async def start_watering(self, station: int, duration_sec: int) -> bool:
