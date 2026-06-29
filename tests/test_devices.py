@@ -12,6 +12,7 @@ import pytest
 
 from orbit_bhyve.devices import (
     BHyveHT25Device,
+    BHyveHT25Fw0085Device,
     BHyveHT25G2Device,
     BHyveHT34ADevice,
     BHyveHubDevice,
@@ -28,9 +29,9 @@ from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
         ("", "", "bridge", BHyveHubDevice),               # hub wins on type
         ("HT34A-0001", "0107", "", BHyveHT34ADevice),     # XD 4-port
         ("HT25G2-0001", "0111", "", BHyveHT25G2Device),   # Gen2 by suffix
-        ("HT25-0001", "0111", "", BHyveHT25G2Device),     # Gen2 by fw0111
-        ("HT25-0001", "0085", "", BHyveHT25Device),       # legacy mesh hose timer
-        ("HT25-0001", "0041", "", BHyveHT25Device),       # legacy mesh hose timer
+        ("HT25-0001", "0111", "", BHyveHT25G2Device),       # Gen2 by fw0111
+        ("HT25-0001", "0085", "", BHyveHT25Fw0085Device),   # mesh fw0085 (upstream subclass)
+        ("HT25-0001", "0041", "", BHyveHT25Device),         # mesh base (fw0041)
     ],
 )
 def test_resolve_routes(hardware, firmware, type_, expected):

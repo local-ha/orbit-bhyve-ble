@@ -9,6 +9,7 @@ from __future__ import annotations
 from .base import BHyveBleDeviceBase, DeviceState, UnsupportedModel
 from .hub import BHyveHubDevice
 from .ht25 import BHyveHT25Device
+from .ht25_fw0085 import BHyveHT25Fw0085Device
 from .ht25g2 import BHyveHT25G2Device
 from .ht34a import BHyveHT34ADevice
 
@@ -18,6 +19,7 @@ __all__ = [
     "UnsupportedModel",
     "BHyveHubDevice",
     "BHyveHT25Device",
+    "BHyveHT25Fw0085Device",
     "BHyveHT25G2Device",
     "BHyveHT34ADevice",
     "resolve_device_class",
@@ -36,9 +38,12 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
         # the hardware suffix or fw so HT25-0000 (fw0041/0085) is untouched.
         if (hardware or "").startswith("HT25G2") or firmware == "0111":
             return BHyveHT25G2Device
-        # All HT25-0000 mesh firmwares (fw0041/0085/…) use the parameterized
-        # class, which builds frames from the device's own mesh_device_id. The
-        # old fw0085 path hardcoded one specific device's identity.
+        # HT25-0000 mesh (d7-47) firmwares. fw0085 keeps upstream's thin
+        # subclass (retains _rebind_sid_delta=3, community-verified); fw0041 and
+        # any other fw use the parameterized base, which builds frames from the
+        # device's own mesh_device_id (not a hardcoded identity).
+        if firmware == "0085":
+            return BHyveHT25Fw0085Device
         return BHyveHT25Device
     if (hardware or "").startswith("HT34A"):
         return BHyveHT34ADevice
