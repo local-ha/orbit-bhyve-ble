@@ -31,6 +31,8 @@ import struct
 import json
 import os
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -206,6 +208,27 @@ def build_stop_protobuf():
     return bytes.fromhex("720408021200")
 
 
+def build_rain_delay_protobuf(minutes, expiry=None):
+    """Rain delay: #17 { #1=minutes; #3=expiryUnixUTC; #4=1 }.
+
+    `minutes=0` clears the delay (sent as a bare #17{#1=0}). For a set, the app
+    sends an absolute expiry (deviceClock + minutes*60) and the enable flag; the
+    device echoes its own authoritative expiry back in #16.#13.
+    """
+    body = pb_field_varint(1, minutes)
+    if minutes > 0 and expiry is not None:
+        body += pb_field_varint(3, expiry) + pb_field_varint(4, 1)
+    return pb_field_bytes(17, body)
+
+
+def build_request_status_protobuf():
+    """Status request: #15 {} (empty). Elicits a full #16 status burst — works
+    even when the device is "active" (watering or rain-delay), unlike the
+    unsolicited connect-time push which the device suppresses in those states.
+    """
+    return pb_field_bytes(15, b"")
+
+
 # ─── Session derivation ────────────────────────────────────────────────────
 
 def derive_session(init_tx, rx_resp):
@@ -357,7 +380,11 @@ def pb_format(data, indent=1):
 # RX message field numbers (see docs/ble_protocol.md "Device→Host (RX) Notifications").
 RX_F_CLOCK = 7             # wrapper: device clock, Unix epoch seconds
 RX_F_STATUS = 16          # device status / state submessage
-RX_F_STATUS_MODE = 1      #   #16.#1: 1=idle, 4=manual running
+RX_F_STATUS_MODE = 1      #   #16.#1: 1=idle, 3=rain-delay, 4=manual running
+RX_F_STATUS_RAINDELAY = 13  # #16.#13: rain-delay block { #1=min, #3=expiry, #4=on }
+RX_F_RD_MINUTES = 1       #   #16.#13.#1: rain-delay minutes
+RX_F_RD_EXPIRY = 3        #   #16.#13.#3: rain-delay expiry, Unix epoch seconds
+RX_F_RD_ENABLED = 4       #   #16.#13.#4: rain-delay enabled flag (0/1)
 RX_F_STATUS_BATT = 14     #   #16.#14: battery block { #3 = mV }
 RX_F_BATT_MV = 3          #   battery millivolts (in #16.#14 and #46)
 RX_F_BATTERY_REPORT = 46  # standalone battery report { #3 = mV }
@@ -367,10 +394,13 @@ RX_F_WATERING_ACTIVE = 1
 
 class DeviceStatus(NamedTuple):
     """Decoded device telemetry from an RX notification (absent fields => None)."""
-    run_state: int | None        # #16.#1: 1=idle, 4=running
+    run_state: int | None        # #16.#1: 1=idle, 3=rain-delay, 4=running
     is_watering: bool | None     # derived from #16.#1 / #59.#1
     battery_mv: int | None       # #16.#14.#3 or standalone #46.#3
-    device_clock: int | None = None  # #7 Unix epoch seconds
+    device_clock: int | None = None        # #7 Unix epoch seconds
+    rain_delay_minutes: int | None = None  # #16.#13.#1
+    rain_delay_expiry: int | None = None   # #16.#13.#3, Unix epoch seconds
+    rain_delay_active: bool | None = None  # #16.#13.#4
 
 
 def _pb_field(fields, num):
@@ -397,12 +427,27 @@ def extract_status(protobuf):
 
     clock = _pb_field(top, RX_F_CLOCK)
     run_state = battery_mv = is_watering = None
+    rd_minutes = rd_expiry = rd_active = None
 
     status = _pb_field(top, RX_F_STATUS)          # #16 submessage
     if isinstance(status, (bytes, bytearray)):
         sfields = pb_parse(status)
         run_state = _pb_field(sfields, RX_F_STATUS_MODE)
         battery_mv = _pb_subfield(sfields, RX_F_STATUS_BATT, RX_F_BATT_MV)  # #16.#14.#3
+        rd = _pb_field(sfields, RX_F_STATUS_RAINDELAY)                      # #16.#13
+        if isinstance(rd, (bytes, bytearray)):
+            rdf = pb_parse(rd)
+            rd_minutes = _pb_field(rdf, RX_F_RD_MINUTES)
+            rd_expiry = _pb_field(rdf, RX_F_RD_EXPIRY)
+            enabled = _pb_field(rdf, RX_F_RD_ENABLED)
+            # A cleared delay echoes a bare #13{#1=0} (no #4); derive active from
+            # minutes when #4 is absent so the cleared state isn't ambiguous.
+            if enabled is not None:
+                rd_active = bool(enabled)
+            elif rd_minutes is not None:
+                rd_active = rd_minutes > 0
+            else:
+                rd_active = None
 
     if battery_mv is None:                         # standalone #46.#3
         battery_mv = _pb_subfield(top, RX_F_BATTERY_REPORT, RX_F_BATT_MV)
@@ -418,6 +463,9 @@ def extract_status(protobuf):
         is_watering=is_watering,
         battery_mv=battery_mv,
         device_clock=clock,
+        rain_delay_minutes=rd_minutes,
+        rain_delay_expiry=rd_expiry,
+        rain_delay_active=rd_active,
     )
 
 
@@ -565,13 +613,20 @@ class _RxCollector:
     def merged_status(self):
         """Combine telemetry across decoded frames (types carry different fields)."""
         run_state = is_watering = battery_mv = device_clock = None
+        rd_minutes = rd_expiry = rd_active = None
         for inner in self.decoded:
             st = extract_status(inner["protobuf"])
             run_state = st.run_state if st.run_state is not None else run_state
             is_watering = st.is_watering if st.is_watering is not None else is_watering
             battery_mv = st.battery_mv if st.battery_mv is not None else battery_mv
             device_clock = st.device_clock if st.device_clock is not None else device_clock
-        return DeviceStatus(run_state, is_watering, battery_mv, device_clock)
+            rd_minutes = st.rain_delay_minutes if st.rain_delay_minutes is not None else rd_minutes
+            rd_expiry = st.rain_delay_expiry if st.rain_delay_expiry is not None else rd_expiry
+            rd_active = st.rain_delay_active if st.rain_delay_active is not None else rd_active
+        return DeviceStatus(
+            run_state, is_watering, battery_mv, device_clock,
+            rd_minutes, rd_expiry, rd_active,
+        )
 
 
 def _format_status(st):
@@ -585,6 +640,21 @@ def _format_status(st):
     if st.device_clock is not None:
         parts.append(f"clock {st.device_clock}")
     return ", ".join(parts) if parts else "no decodable telemetry"
+
+
+def _format_rain_delay(st):
+    """Human-readable rain-delay summary from a DeviceStatus (#16.#13)."""
+    if st.rain_delay_active is None and st.rain_delay_minutes is None:
+        if st.run_state == 3:        # run-state says rain-delay, block not decoded
+            return "active (duration unknown)"
+        return "unknown (no status decoded)"
+    if not st.rain_delay_active or not st.rain_delay_minutes:
+        return "off"
+    parts = [f"{st.rain_delay_minutes} min ({st.rain_delay_minutes / 60:g} h)"]
+    if st.rain_delay_expiry:
+        ends = datetime.fromtimestamp(st.rain_delay_expiry, tz=timezone.utc).astimezone()
+        parts.append(f"ends {ends:%Y-%m-%d %H:%M}")
+    return ", ".join(parts)
 
 
 async def _await_rx(collector, first_timeout, drain=1.5):
@@ -632,7 +702,8 @@ async def ble_command(mac, network_key, command, zones=None, duration=600):
     print(f"Scanning for {mac}...")
     device = await BleakScanner.find_device_by_address(mac, timeout=25.0)
     if device is None:
-        print(f"{mac} not found — is it awake (press the button) and in range?")
+        print(f"{mac} not found — check it's powered and in BLE range "
+              "(the scan can miss it transiently; just retry).")
         return
     print("Found. Connecting...")
 
@@ -680,7 +751,8 @@ async def ble_status(mac, network_key):
     print(f"Scanning for {mac}...")
     device = await BleakScanner.find_device_by_address(mac, timeout=25.0)
     if device is None:
-        print(f"{mac} not found — is it awake (press the button) and in range?")
+        print(f"{mac} not found — check it's powered and in BLE range "
+              "(the scan can miss it transiently; just retry).")
         return
     print("Found. Connecting...")
 
@@ -704,6 +776,73 @@ async def ble_status(mac, network_key):
             # command, so on/off confirmations read back state even when this won't.
             print("Connected, but the device sent no status push "
                   "(it may not volunteer state while active).")
+
+
+async def ble_rain_delay(mac, network_key, action, hours=None):
+    from bleak import BleakClient, BleakScanner
+
+    key = bytes.fromhex(network_key)
+    print(f"Scanning for {mac}...")
+    device = await BleakScanner.find_device_by_address(mac, timeout=25.0)
+    if device is None:
+        print(f"{mac} not found — check it's powered and in BLE range "
+              "(the scan can miss it transiently; just retry).")
+        return
+    print("Found. Connecting...")
+
+    async with BleakClient(device, timeout=15.0) as client:
+        await _connect(client)
+        collector = _RxCollector()
+        iv, counter = await _init_session(client, key, collector)
+
+        async def send_pb(protobuf):
+            nonlocal counter
+            msg = build_message(protobuf)
+            ct, counter = aes_encrypt(key, iv, counter, msg)
+            await client.write_gatt_char(
+                WRITE_CHAR, build_ble_frame(ct, compute_trailer(msg)), response=False
+            )
+
+        # Don't depend on the unsolicited connect-time push: the device
+        # suppresses it while "active" (watering or rain-delay active). Solicit
+        # a #16 status burst with #15{} — reliable in every state. It carries the
+        # device clock (for a set's expiry) and the current rain-delay block.
+        await send_pb(build_request_status_protobuf())
+        await _await_rx(collector, first_timeout=6.0)
+        st = collector.merged_status()
+
+        if action == "get":
+            print(f"Rain delay: {_format_rain_delay(st)}")
+            await client.stop_notify(READ_CHAR)
+            return
+
+        if action == "set":
+            minutes = int(round(hours * 60))
+            clock = st.device_clock or int(time.time())
+            protobuf = build_rain_delay_protobuf(minutes, clock + minutes * 60)
+            label = f"set {hours:g}h ({minutes} min)"
+        else:  # clear
+            protobuf = build_rain_delay_protobuf(0)
+            label = "clear"
+
+        # Reset so merged_status reflects only the post-command echo, not the
+        # status burst we already consumed above.
+        collector.decoded.clear()
+        collector.event.clear()
+        await send_pb(protobuf)
+        print(f"Rain delay {label} — sent!")
+
+        await _await_rx(collector, first_timeout=4.0)
+        if collector.decoded:
+            st2 = collector.merged_status()
+            extra = f" [run_state={st2.run_state}]" if st2.run_state is not None else ""
+            print(f"Confirmed: {_format_rain_delay(st2)}{extra}")
+        elif collector.raw:
+            print(f"Device responded ({len(collector.raw)} notification(s)) but none decoded.")
+        else:
+            print("No confirmation notification received.")
+        await client.stop_notify(READ_CHAR)
+        print("Done.")
 
 
 def cmd_control(args):
@@ -763,6 +902,34 @@ def cmd_status(args):
     asyncio.run(ble_status(mac, network_key))
 
 
+def cmd_rain_delay(args):
+    config = load_config()
+
+    if not config.get("devices"):
+        print("No devices configured. Run setup first:")
+        print("  python3 bhyve.py setup")
+        sys.exit(1)
+
+    dev_idx = (args.device or 1) - 1
+    if dev_idx < 0 or dev_idx >= len(config["devices"]):
+        print(f"Device {dev_idx+1} not found. You have {len(config['devices'])} device(s).")
+        sys.exit(1)
+
+    if args.rd_action == "set" and args.hours is None:
+        print("Error: 'rain-delay set' requires an hours value, e.g. `rain-delay set 24`")
+        sys.exit(1)
+    if args.rd_action == "set" and args.hours < 0:
+        print("Error: hours must be >= 0 (use `rain-delay clear` to turn it off)")
+        sys.exit(1)
+
+    dev = config["devices"][dev_idx]
+    mac = args.mac or dev["mac"]
+    network_key = dev["network_key"]
+
+    print(f"B-Hyve Controller — {dev['name']}")
+    asyncio.run(ble_rain_delay(mac, network_key, args.rd_action, args.hours))
+
+
 # ─── CLI ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -780,6 +947,9 @@ Control:
   %(prog)s on 2 60           Zone 2 on for 1 minute
   %(prog)s off               Stop all watering
   %(prog)s status            Read device telemetry (battery, state)
+  %(prog)s rain-delay get    Read the current rain delay
+  %(prog)s rain-delay set 24 Delay watering for 24 hours
+  %(prog)s rain-delay clear  Clear the rain delay
 
 ⚠️  Do NOT update your B-Hyve firmware — it may break this tool!
         """,
@@ -810,6 +980,15 @@ Control:
     status_p.add_argument("--device", "-d", type=int, help="Device number (if multiple)")
     status_p.add_argument("--mac", help="Override MAC address")
 
+    # Rain delay
+    rd_p = sub.add_parser("rain-delay", help="Get/set/clear the rain delay")
+    rd_p.add_argument("rd_action", choices=["get", "set", "clear"],
+                      help="get current delay, set <hours>, or clear it")
+    rd_p.add_argument("hours", nargs="?", type=float,
+                      help="Hours of delay (for 'set'), e.g. 24")
+    rd_p.add_argument("--device", "-d", type=int, help="Device number (if multiple)")
+    rd_p.add_argument("--mac", help="Override MAC address")
+
     args = parser.parse_args()
 
     if args.action == "setup":
@@ -819,6 +998,8 @@ Control:
         cmd_control(args)
     elif args.action == "status":
         cmd_status(args)
+    elif args.action == "rain-delay":
+        cmd_rain_delay(args)
     else:
         parser.print_help()
 

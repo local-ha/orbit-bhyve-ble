@@ -116,7 +116,8 @@ class LiveSession:
 
         device = await BleakScanner.find_device_by_address(self.mac, timeout=self.scan_timeout)
         if device is None:
-            sys.exit(f"{self.mac} not found — is it awake and in range?")
+            sys.exit(f"{self.mac} not found — check it's powered and in BLE range "
+                     "(the scan can miss it transiently; just retry).")
         self.client = BleakClient(device, timeout=self.connect_timeout)
         await self.client.__aenter__()
 
