@@ -85,6 +85,31 @@ def test_stop_frame_is_crc_valid():
     assert rx.decode_inner(tx._build_message(tx._STOP_PB)) == tx._STOP_PB
 
 
+# --- rain delay (#17) TX round-trip ---------------------------------------
+
+def test_rain_delay_set_carries_minutes_expiry_and_flag():
+    # 24h == 1440 minutes (the catalog-confirmed value).
+    pb = tx._build_rain_delay_pb(1440, 1_700_000_000)
+    rd = rx.pb_parse(rx._pb_field(rx.pb_parse(pb), 17))
+    assert rx._pb_field(rd, 1) == 1440             # minutes
+    assert rx._pb_field(rd, 3) == 1_700_000_000    # expiry (Unix)
+    assert rx._pb_field(rd, 4) == 1                # enable flag
+
+
+def test_rain_delay_clear_is_minutes_zero_only():
+    # A clear is a bare #17{#1=0} — no expiry, no enable flag.
+    pb = tx._build_rain_delay_pb(0, None)
+    rd = rx.pb_parse(rx._pb_field(rx.pb_parse(pb), 17))
+    assert rx._pb_field(rd, 1) == 0
+    assert rx._pb_field(rd, 3) is None
+    assert rx._pb_field(rd, 4) is None
+
+
+def test_rain_delay_message_round_trips_crc():
+    frame = tx._build_message(tx._build_rain_delay_pb(720, 1_700_000_000))
+    assert rx.decode_inner(frame) == tx._build_rain_delay_pb(720, 1_700_000_000)
+
+
 # --- RX status decode -----------------------------------------------------
 
 def test_extract_status_idle_with_battery():
@@ -116,6 +141,50 @@ def test_standalone_battery_report_field_46():
     assert st.battery_mv == 2800
     assert st.run_state is None
     assert st.is_watering is None
+
+
+def _status_with_rain_delay(minutes, expiry=None, enabled=1) -> bytes:
+    """Build a #16 status carrying a #16.#13 rain-delay block, as the device
+    emits it (run-state 3 while a delay is active)."""
+    rd = tx._pb_field_varint(rx.RX_F_RD_MINUTES, minutes)
+    if expiry is not None:
+        rd += tx._pb_field_varint(rx.RX_F_RD_EXPIRY, expiry)
+    rd += tx._pb_field_varint(rx.RX_F_RD_ENABLED, enabled)
+    sub = tx._pb_field_varint(rx.RX_F_STATUS_MODE, 3 if enabled else 1)
+    sub += tx._pb_field_bytes(rx.RX_F_STATUS_RAINDELAY, rd)
+    return tx._pb_field_bytes(rx.RX_F_STATUS, sub)
+
+
+def test_extract_status_rain_delay_active():
+    st = rx.extract_status(_status_with_rain_delay(1440, 1_700_000_000, 1))
+    assert st.run_state == 3
+    assert st.is_watering is False         # rain delay is not "watering"
+    assert st.rain_delay_minutes == 1440
+    assert st.rain_delay_expiry == 1_700_000_000
+    assert st.rain_delay_active is True
+
+
+def test_extract_status_rain_delay_idle_shape():
+    # Idle device reports {#1=0, #4=0}.
+    st = rx.extract_status(_status_with_rain_delay(0, expiry=None, enabled=0))
+    assert st.rain_delay_minutes == 0
+    assert st.rain_delay_active is False
+
+
+def _status_bare_rain_delay(minutes) -> bytes:
+    """#16 carrying a bare #13{#1=minutes} with NO #4 enabled field — the exact
+    shape a real device emits after a clear (hardware-confirmed 2026-06-30)."""
+    rd = tx._pb_field_varint(rx.RX_F_RD_MINUTES, minutes)
+    sub = tx._pb_field_varint(rx.RX_F_STATUS_MODE, 1)
+    sub += tx._pb_field_bytes(rx.RX_F_STATUS_RAINDELAY, rd)
+    return tx._pb_field_bytes(rx.RX_F_STATUS, sub)
+
+
+def test_extract_status_rain_delay_cleared_bare_block():
+    # Bare #13{#1=0} (no #4) must read as off, not ambiguous (active=None).
+    st = rx.extract_status(_status_bare_rain_delay(0))
+    assert st.rain_delay_minutes == 0
+    assert st.rain_delay_active is False
 
 
 def test_decode_inner_rejects_bad_crc():
@@ -165,6 +234,36 @@ def test_apply_rejects_out_of_band_battery():
     dev = _fake_device()
     rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=1, battery_mv=5000)))
     assert dev.battery_mv is None  # 5000 mV is out of the 1500..4000 sanity band
+
+
+def test_apply_sets_rain_delay_state():
+    dev = _fake_device()
+    frame = tx._build_message(_status_with_rain_delay(720, 1_700_000_000, 1))
+    rx.apply_status_plaintext(dev, frame)
+    assert dev.state.rain_delay_minutes == 720
+    assert dev.state.rain_delay_ends is not None
+    assert dev.state.rain_delay_ends.timestamp() == 1_700_000_000
+
+
+def test_apply_clears_rain_delay_on_idle_shape():
+    dev = _fake_device()
+    dev.state.rain_delay_minutes = 720  # pretend a delay was set
+    frame = tx._build_message(_status_with_rain_delay(0, expiry=None, enabled=0))
+    rx.apply_status_plaintext(dev, frame)
+    assert dev.state.rain_delay_minutes == 0
+    assert dev.state.rain_delay_ends is None
+
+
+def test_apply_clears_rain_delay_on_bare_block():
+    # Regression: a clear arriving as bare #13{#1=0} (no #4) must still clear a
+    # previously-set delay (HA showed a stale value before this fix, 2026-06-30).
+    dev = _fake_device()
+    dev.state.rain_delay_minutes = 60  # 1h was set
+    from datetime import datetime, timezone
+    dev.state.rain_delay_ends = datetime.now(timezone.utc)
+    rx.apply_status_plaintext(dev, tx._build_message(_status_bare_rain_delay(0)))
+    assert dev.state.rain_delay_minutes == 0
+    assert dev.state.rain_delay_ends is None
 
 
 def test_apply_ignores_desynced_frame():
