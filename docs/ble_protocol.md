@@ -131,15 +131,19 @@ Observed live across single-station valves (fw `0111`) and the XD 4-port (fw `01
   reliably reads back the resulting run-state and battery. This is the dependable way to read
   state.
 - **Unsolicited connect-time push (idle: reliable; active: not).** On connect, an **idle**
-  device reliably pushes a `#16` status (the CLI's `status` command depends on this). While a
-  zone is **actively watering**, the connect-time push is unreliable — sometimes only a minimal
-  clock-bearing ack arrives, sometimes nothing — so a passive mid-run `status` may come up
-  empty even though the connection succeeded.
+  device reliably pushes a `#16` status (the CLI's `status` command depends on this). When the
+  device is **active** — **actively watering (run-state 4)** *or* with a **rain delay active
+  (run-state 3)** — the connect-time push is unreliable: sometimes only a minimal clock-bearing
+  ack arrives, sometimes nothing, so a passive `status`/`rain-delay get` may come up empty even
+  though the connection succeeded. (Hardware-confirmed 2026-06-30: a fresh-session `rain-delay
+  get` against a Gen2 valve holding an active 24 h delay returned no decodable status twice in a
+  row, then read back correctly once a `#15{}` request was sent first.)
 
-**Implication / TODO.** A dependable *mid-run* status read needs a benign **"request status"
-TX** to elicit the burst rather than waiting for a volunteered push. The app's timestamp-sync
-message (see "Verifying Your Connection") is a known status-eliciting write and a good RE
-starting point; capture it and add it to the TX command catalog.
+**Implication (resolved).** A dependable status read in any state needs a benign **"request
+status" TX** (`#15 {}`, the empty status request in the catalog above) to elicit the `#16` burst
+rather than waiting for a volunteered push. The CLI's `rain-delay` command now sends `#15{}`
+right after the handshake for exactly this reason; the HA side adopts it as the canonical
+`refresh_state()` in the status-poll-refresh phase.
 
 ## Capability Command Catalog (2026-06-28 XD full-surface app capture)
 
@@ -166,7 +170,7 @@ behaviorally cross-checked against the operator's action log**, not vendor-confi
 | **Stop watering** | `#14 { #1=2; #2={} }` | `72 04 08 02 12 00`. |
 | **Request status** | `#15 {}` (empty) | Elicits a full `#16` status burst — **works mid-run** (the dependable poll the old TODO wanted). |
 | **Set clock (timestamp-sync)** | `#18 { #1 = "YYYY-MM-DDThh:mm:ss±hh:mm" }` | ISO-8601 local string; sent on connect. Benign liveness check. |
-| **Set / clear rain delay** | `#17 { #1=minutes; #3=expiryUnixUTC; #4=1 }` | `minutes=0` clears. `expiry = deviceClock + minutes·60`. Confirmed 1440=24 h, 2880=48 h. |
+| **Set / clear rain delay** | `#17 { #1=minutes; #3=expiryUnixUTC; #4=1 }` | `minutes=0` clears. `expiry = deviceClock + minutes·60`. Confirmed 1440=24 h, 2880=48 h. **The device honors `#3` literally and stores `#1` independently** (skew probe 2026-06-30: sent `#1=360 min` with a skewed `#3=clock+1h`; the device echoed back `#1=360` *and* `#3=clock+1h` unchanged — it enforces the absolute `#3`, it does **not** recompute it from `#1`). ⇒ **`#3` must be anchored to the *device* clock** (`#7`), not the host clock; with a clock-skewed device a host-anchored expiry ends the delay early/late by the skew. Keep `#1` and `#3` consistent (`#3 = deviceClock + #1·60`). |
 | **Create / edit / replace program** | `#19 { … }` | Write the full program to its slot (`#1`). **Replace** = write the replacement's content to the target slot — no special opcode. Full schema below. |
 | **Delete program** | `#19 { #1=slot; #17=name; #10/#14/#15/#16/#21; *no* #8, *no* #9 }` | A slot write stripped of start times (`#8`) and zone durations (`#9`) clears the slot. Confirmed deleting two programs (slots A and C). |
 | **Subscribe / poll status (flow)** | `#57 { #1=intervalMs; #2=type }` | `#1=1000` → device streams periodic `#59` ~1/s; used by the flow screen. (Gen2.) |
