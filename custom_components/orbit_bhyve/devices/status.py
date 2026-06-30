@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import struct
+from datetime import datetime, timezone
 from typing import NamedTuple
 
 from .base import _mv_to_pct
@@ -24,7 +25,11 @@ MSG_HEADER = bytes([0xAA, 0x77, 0x5A, 0x0F])
 
 # RX message field numbers (see docs/ble_protocol.md).
 RX_F_STATUS = 16          # device status submessage
-RX_F_STATUS_MODE = 1      #   #16.#1: 1=idle, 4=manual running
+RX_F_STATUS_MODE = 1      #   #16.#1: 1=idle, 3=rain-delay, 4=manual running
+RX_F_STATUS_RAINDELAY = 13  # #16.#13: rain-delay block { #1=min, #3=expiry, #4=on }
+RX_F_RD_MINUTES = 1       #   #16.#13.#1: rain-delay minutes
+RX_F_RD_EXPIRY = 3        #   #16.#13.#3: rain-delay expiry, Unix epoch seconds
+RX_F_RD_ENABLED = 4       #   #16.#13.#4: rain-delay enabled flag (0/1)
 RX_F_STATUS_BATT = 14     #   #16.#14: battery block { #3 = mV }
 RX_F_BATT_MV = 3          #   battery millivolts (#16.#14.#3 or #46.#3)
 RX_F_BATTERY_REPORT = 46  # standalone battery report { #3 = mV }
@@ -120,9 +125,12 @@ def _pb_subfield(fields, outer, inner):
 
 
 class DeviceStatus(NamedTuple):
-    run_state: int | None        # #16.#1: 1=idle, 4=running
+    run_state: int | None        # #16.#1: 1=idle, 3=rain-delay, 4=running
     is_watering: bool | None     # derived from #16.#1 / #59.#1
     battery_mv: int | None       # #16.#14.#3 or standalone #46.#3
+    rain_delay_minutes: int | None = None  # #16.#13.#1
+    rain_delay_expiry: int | None = None   # #16.#13.#3, Unix epoch seconds
+    rain_delay_active: bool | None = None  # #16.#13.#4
 
 
 def extract_status(protobuf: bytes) -> DeviceStatus:
@@ -131,12 +139,28 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         return DeviceStatus(None, None, None)
 
     run_state = battery_mv = is_watering = None
+    rd_minutes = rd_expiry = rd_active = None
 
     status = _pb_field(top, RX_F_STATUS)          # #16 submessage
     if isinstance(status, (bytes, bytearray)):
         sfields = pb_parse(status)
         run_state = _pb_field(sfields, RX_F_STATUS_MODE)
         battery_mv = _pb_subfield(sfields, RX_F_STATUS_BATT, RX_F_BATT_MV)
+        rd = _pb_field(sfields, RX_F_STATUS_RAINDELAY)   # #16.#13
+        if isinstance(rd, (bytes, bytearray)):
+            rdf = pb_parse(rd)
+            rd_minutes = _pb_field(rdf, RX_F_RD_MINUTES)
+            rd_expiry = _pb_field(rdf, RX_F_RD_EXPIRY)
+            enabled = _pb_field(rdf, RX_F_RD_ENABLED)
+            # A cleared delay echoes a bare #13{#1=0} (no #4), so don't leave
+            # active=None there or the clear is dropped — derive it from minutes
+            # when #4 is absent.
+            if enabled is not None:
+                rd_active = bool(enabled)
+            elif rd_minutes is not None:
+                rd_active = rd_minutes > 0
+            else:
+                rd_active = None
 
     if battery_mv is None:                         # standalone #46.#3
         battery_mv = _pb_subfield(top, RX_F_BATTERY_REPORT, RX_F_BATT_MV)
@@ -147,7 +171,14 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
     elif run_state is not None:
         is_watering = run_state == 4
 
-    return DeviceStatus(run_state=run_state, is_watering=is_watering, battery_mv=battery_mv)
+    return DeviceStatus(
+        run_state=run_state,
+        is_watering=is_watering,
+        battery_mv=battery_mv,
+        rain_delay_minutes=rd_minutes,
+        rain_delay_expiry=rd_expiry,
+        rain_delay_active=rd_active,
+    )
 
 
 def apply_status_plaintext(device, pt: bytes) -> None:
@@ -169,8 +200,25 @@ def apply_status_plaintext(device, pt: bytes) -> None:
             device.state.active_zone = None
             device.state.seconds_remaining = None
 
-    if st.battery_mv is not None or st.is_watering is not None:
+    if st.rain_delay_active is not None:
+        if st.rain_delay_active and st.rain_delay_minutes:
+            device.state.rain_delay_minutes = st.rain_delay_minutes
+            device.state.rain_delay_ends = (
+                datetime.fromtimestamp(st.rain_delay_expiry, tz=timezone.utc)
+                if st.rain_delay_expiry
+                else None
+            )
+        else:
+            device.state.rain_delay_minutes = 0
+            device.state.rain_delay_ends = None
+
+    if (
+        st.battery_mv is not None
+        or st.is_watering is not None
+        or st.rain_delay_active is not None
+    ):
         _LOGGER.debug(
-            "%s: live status battery=%smv watering=%s run_state=%s",
+            "%s: live status battery=%smv watering=%s run_state=%s rain_delay=%s",
             device.mac, st.battery_mv, st.is_watering, st.run_state,
+            st.rain_delay_minutes,
         )

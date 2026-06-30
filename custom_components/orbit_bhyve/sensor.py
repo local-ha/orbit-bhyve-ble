@@ -7,6 +7,8 @@ discharge approximation (`devices.base._mv_to_pct`).
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfElectricPotential
@@ -17,6 +19,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
 from .devices.base import _mv_to_pct
+from .devices.protobuf import BHyveProtobufDevice
 
 
 async def async_setup_entry(
@@ -36,6 +39,9 @@ async def async_setup_entry(
             continue
         entities.append(BHyveBatterySensor(coord))
         entities.append(BHyveBatteryVoltageSensor(coord))
+        # Rain delay is a protobuf-family (HT34A/HT25G2) capability.
+        if isinstance(device, BHyveProtobufDevice):
+            entities.append(BHyveRainDelayEndsSensor(coord))
     async_add_entities(entities)
 
 
@@ -91,3 +97,21 @@ class BHyveBatteryVoltageSensor(_BHyveDeviceSensorBase):
     @property
     def native_value(self) -> int | None:
         return self.coordinator.device.battery_mv
+
+
+class BHyveRainDelayEndsSensor(_BHyveDeviceSensorBase):
+    """Timestamp when the active rain delay expires; None when off."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:weather-rainy"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_rain_delay_ends"
+        self._attr_name = "Rain delay ends"
+
+    @property
+    def native_value(self) -> datetime | None:
+        state = self.coordinator.data or self.coordinator.device.state
+        return state.rain_delay_ends

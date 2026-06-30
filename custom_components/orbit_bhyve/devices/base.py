@@ -32,6 +32,8 @@ class DeviceState:
     last_command_label: str | None = None
     is_connected: bool = False
     notifications_last_cmd: int = 0
+    rain_delay_minutes: int | None = None
+    rain_delay_ends: datetime | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 

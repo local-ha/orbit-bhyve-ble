@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import struct
+import time
 
 from .base import BHyveBleDeviceBase
 from .status import MSG_HEADER, _crc16_ccitt, apply_status_plaintext
@@ -57,6 +58,18 @@ def _build_start_pb(station_id: int, duration_sec: int) -> bytes:
 
 
 _STOP_PB = bytes.fromhex("720408021200")
+
+
+def _build_rain_delay_pb(minutes: int, expiry: int | None) -> bytes:
+    """Rain delay: #17 { #1=minutes; #3=expiryUnixUTC; #4=1 }.
+
+    `minutes=0` clears the delay (bare #17{#1=0}). The device echoes its own
+    authoritative expiry back in #16.#13, which apply_status_plaintext stores.
+    """
+    body = _pb_field_varint(1, minutes)
+    if minutes > 0 and expiry is not None:
+        body += _pb_field_varint(3, expiry) + _pb_field_varint(4, 1)
+    return _pb_field_bytes(17, body)
 
 
 class BHyveProtobufDevice(BHyveBleDeviceBase):
@@ -124,3 +137,39 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             "%s: %s STOP failed to close after retries", self.mac, self.log_label
         )
         return False
+
+    async def set_rain_delay(self, minutes: int) -> bool:
+        """Set the rain delay to `minutes` (0 clears). Returns True once the
+        device's #16.#13 echo confirms the new state."""
+        if self.connection is None:
+            return False
+        if minutes <= 0:
+            return await self.clear_rain_delay()
+        # Absolute expiry the device enforces. A skew probe (2026-06-30) showed
+        # the device honors #3 LITERALLY (it does not recompute it from #1
+        # minutes), so #3 should be anchored to the *device* clock, not the host
+        # clock. The device clock is app-synced (Δ≈0), so host UTC works in
+        # practice today; anchoring to the device clock (via the Phase 2 #15{}
+        # refresh that will store DeviceState.device_clock) is the clean fix and
+        # is tracked there. The echoed #16.#13.#3 (-> rain_delay_ends) always
+        # displays the device's own value regardless.
+        expiry = int(time.time()) + minutes * 60
+        plaintext = _build_message(_build_rain_delay_pb(minutes, expiry))
+        notifs = await self.connection.send(plaintext, drain_ms=2000)
+        self._stamp_command(f"rain_delay set {minutes}m", len(notifs))
+        ok = bool(self.state.rain_delay_minutes)
+        _LOGGER.log(
+            logging.DEBUG if ok else logging.WARNING,
+            "%s: %s rain-delay set %dm %s",
+            self.mac, self.log_label, minutes, "confirmed" if ok else "unconfirmed",
+        )
+        return ok
+
+    async def clear_rain_delay(self) -> bool:
+        """Clear the rain delay (#17{#1=0}). Returns True once #16.#13 reads off."""
+        if self.connection is None:
+            return False
+        plaintext = _build_message(_build_rain_delay_pb(0, None))
+        notifs = await self.connection.send(plaintext, drain_ms=2000)
+        self._stamp_command("rain_delay clear", len(notifs))
+        return not self.state.rain_delay_minutes
