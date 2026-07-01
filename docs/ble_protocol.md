@@ -109,7 +109,7 @@ whose **field number selects the message type**:
 
 | `#N` | Meaning (observed) | Key inner fields |
 |---|---|---|
-| `#16` | **Device status / state** (pushed on connect and on every state change) | `#1` mode (`1`=idle, `4`=manual running); `#10` next-event Unix ts; `#13 {#1, #3 last-event ts, #4}`; **`#14 {#3 = battery mV}`**; `#16` 8-byte constant token |
+| `#16` | **Device status / state** (pushed on connect and on every state change) | `#1` mode (`1`=idle, `3`=rain-delay, `4`=manual running); `#2` active-run echo (`{#1=2, #2{#3{stationId, runSec}}}`); **`#6` run progress `{#5 total sec, #7 remaining sec}`** (present only while watering); `#10` next-event Unix ts; `#13 {#1 min, #3 last-event ts, #4}`; **`#14 {#3 = battery mV}`**; `#16` 8-byte constant token |
 | `#46` | **Battery report** (standalone) | `#3 = battery mV` (same `{#3: mV}` shape as `#16.#14`) |
 | `#23` | **Device info** | `#2` model string (`HT25G2-0001`); `#3` firmware string (`0111`) |
 | `#19` | **Program / schedule** | `#10`, `#11` Unix ts; `#17` program name (UTF-8, e.g. `"Blueberries And Strawberries"`) |
@@ -208,6 +208,14 @@ Captured by editing one advanced program (name `OurAdvancedProgram`) through eve
   `#17` set command (idle shape is the shorter `{ #1=0, #4=0 }`).
 - **`#16.#2`** echoes the active manual run (`{#1=2, #2{#3{stationId,runSec}}}`); **`#16.#6`**
   carries run progress (`#5` total sec, `#7` remaining sec, `#6{…}`).
+  - **Corroborated upstream (2026-06-30):** ljmerza's v2.1.0 XD decode (`6b131f9`,
+    `devices/ht34a.py:_parse_status`) reads exactly `#16.#6.#7` as *seconds remaining* and
+    `#16.#1` as run-state (1=idle/4=watering) — independent confirmation of these semantics on the
+    HT34/HT34A. **Neither our CLI (`scripts/bhyve.py:extract_status`/`DeviceStatus`) nor our HA
+    `devices/status.py` decodes `#16.#6` yet** — both stop at run-state/battery/rain-delay. Pick up
+    `#16.#6.#7` (remaining) + `#16.#5`/`#16.#2` (total / active station) as an additive parity
+    item (Phase 2 in the capability-buildout plan) — it's the "time remaining" a HA valve/sensor
+    could surface, and a natural rider on our HT25G2 run-state decode PR.
 - **`#19` program** is echoed back on read/save (start times re-emitted as `#8 { #45 = value }`).
 - **`#30`** small command ack around start/stop/clear.
 - **`#59` watering/flow status:** `{ #1=active(0/1), #2=?, #3=flowRateGpm }` — emitted
