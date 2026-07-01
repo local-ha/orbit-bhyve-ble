@@ -12,7 +12,10 @@ Cipher (verified against 257 captured frames + actuated commands):
   Trailer = sum(plaintext) + trailer_const + len.
 Commands use WRITE_REQ (response=True) for its ATT delivery ack; char 6c72 also
 advertises write-without-response, and both modes have been observed to actuate
-the HT34A, so WRITE_REQ is a safe default across device classes.
+the HT34A (fw0107), so WRITE_REQ is a safe default across device classes. The
+device's higher-level ack is a NOTIFICATION, not an ATT Write Response — the
+ESPHome BLE proxy never relays the (absent) write response, so writes wait only
+a capped WRITE_ACK_TIMEOUT_SEC and the notification drain is the real ack.
 """
 from __future__ import annotations
 
@@ -96,11 +99,30 @@ class BHyveBleConnection:
         self._plaintext_observer = observer
 
     async def ensure_connected(self) -> None:
-        """Connect + handshake if not already pooled. Call inside a lock if you
-        need exclusive access; this method itself is idempotent."""
+        """Connect + handshake if not already pooled, retrying the whole open a
+        few times. On a marginal proxy link the connect succeeds but the
+        handshake GATT exchange can stall; a clean retry usually gets through,
+        and the bounded handshake means we fail cleanly rather than wedging.
+        Call inside a lock if you need exclusive access; idempotent otherwise."""
         if self.is_connected and self._handshaken:
             return
-        await self._open()
+        last_err: Exception | None = None
+        for attempt in range(1, OPEN_MAX_ATTEMPTS + 1):
+            try:
+                await self._open()
+                return
+            except (BleHandshakeError, asyncio.TimeoutError) as err:
+                last_err = err
+                _LOGGER.debug(
+                    "%s: open attempt %d/%d failed: %s",
+                    self.mac, attempt, OPEN_MAX_ATTEMPTS, err,
+                )
+                await self.disconnect()
+                if attempt < OPEN_MAX_ATTEMPTS:
+                    await asyncio.sleep(0.5)
+        raise BleHandshakeError(
+            f"{self.mac}: handshake failed after {OPEN_MAX_ATTEMPTS} attempts: {last_err}"
+        )
 
     async def _open(self) -> None:
         from homeassistant.components.bluetooth import async_ble_device_from_address
@@ -144,6 +166,36 @@ class BHyveBleConnection:
         # device tested ("Write not permitted"). Confirmed not the actual
         # mechanism for fw0041 the v1 commit fad91eae assumed.
 
+        # The post-connect handshake (subscribe + AES read/write) is the part
+        # that stalls on a marginal link, so bound it — ensure_connected()
+        # retries the whole open on timeout.
+        try:
+            await asyncio.wait_for(self._handshake(), timeout=HANDSHAKE_TIMEOUT_SEC)
+        except asyncio.TimeoutError as err:
+            raise BleHandshakeError(
+                f"{self.mac}: handshake timed out after {HANDSHAKE_TIMEOUT_SEC}s"
+            ) from err
+
+        # One-shot GATT enumeration — looking for standard Battery Service
+        # (0x180F / 0x2A19) or anything else the device exposes that we
+        # haven't been using. Logged at INFO for reverse-engineering work.
+        try:
+            for service in self._client.services:
+                _LOGGER.info("%s: gatt svc %s", self.mac, service.uuid)
+                for char in service.characteristics:
+                    _LOGGER.info(
+                        "%s:   char %s props=%s",
+                        self.mac, char.uuid, list(char.properties),
+                    )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("%s: gatt enum failed: %s", self.mac, err)
+
+        if self._post_handshake_hook is not None:
+            await self._post_handshake_hook(self)
+
+    async def _handshake(self) -> None:
+        """Subscribe + AES handshake. Bounded by a timeout in _open() because
+        these GATT reads/writes are what stall on a weak link."""
         # Subscribe BEFORE writing — device may stay silent otherwise.
         self._notif_buf.clear()
         await self._client.start_notify(READ_CHAR, self._on_notify)
@@ -257,10 +309,12 @@ class BHyveBleConnection:
         post-handshake hook (which runs inside _open() inside the lock)."""
         frame = self.encrypt(plaintext)
         assert self._client is not None
-        # WRITE_REQ (response=True) is required — the device drops Write Commands
-        # — but it answers via notification and some transports (the ESPHome
-        # proxy) never relay the ATT Write Response, which would block ~30s. Cap
-        # the wait; the notification drain in send() is the real ack.
+        # WRITE_REQ (response=True) is the default — char 6c72 also advertises
+        # write-without-response, but response=True gives ATT-level delivery over
+        # proxies. The device's real ack is a NOTIFICATION, and some transports
+        # (the ESPHome proxy) never relay the ATT Write Response, which would
+        # block ~30s. Cap the wait; the notification drain in send() is the real
+        # ack. Over a direct link the response arrives in <200ms.
         try:
             await asyncio.wait_for(
                 self._client.write_gatt_char(WRITE_CHAR, frame, response=True),
@@ -300,10 +354,12 @@ class BHyveBleConnection:
         + send."""
         async with self._lock:
             if self.is_connected and self._handshaken:
+                # Pooled connection — refresh the (possibly stale) bind in place.
                 if self._post_handshake_hook is not None:
-                    await self._post_handshake_hook(self)  # refresh stale bind in place
+                    await self._post_handshake_hook(self)
             else:
-                await self._open()  # cold — _open() already runs the init hook
+                # Cold — ensure_connected() retries the open and runs the hook.
+                await self.ensure_connected()
             self._notif_buf.clear()
             await self._write_locked(plaintext)
             await asyncio.sleep(drain_ms / 1000.0)

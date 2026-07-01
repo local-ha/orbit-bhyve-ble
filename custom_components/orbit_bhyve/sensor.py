@@ -1,4 +1,4 @@
-"""Sensor platform — battery percent + battery voltage.
+"""Sensor platform — battery percent, battery voltage, and BLE signal strength.
 
 Both sensors are populated from the device's BLE info-ack response on
 every connection: voltage in mV is read directly from payload bytes 4-5
@@ -11,7 +11,12 @@ from datetime import datetime
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfElectricPotential
+from homeassistant.const import (
+    EntityCategory,
+    PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    UnitOfElectricPotential,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -34,11 +39,12 @@ async def async_setup_entry(
         # Every BLE device reports battery over RX; create both sensors so the
         # percent entity exists regardless of whether the cloud snapshot
         # happened to include a pct (the XD reports mv-only). Hubs / key-less
-        # records have no BLE connection and no battery to read.
+        # records have no BLE connection and no battery/signal to read.
         if device.connection is None:
             continue
         entities.append(BHyveBatterySensor(coord))
         entities.append(BHyveBatteryVoltageSensor(coord))
+        entities.append(BHyveRssiSensor(coord))
         # Rain delay is a protobuf-family (HT34A/HT25G2) capability.
         if isinstance(device, BHyveProtobufDevice):
             entities.append(BHyveRainDelayEndsSensor(coord))
@@ -97,6 +103,24 @@ class BHyveBatteryVoltageSensor(_BHyveDeviceSensorBase):
     @property
     def native_value(self) -> int | None:
         return self.coordinator.device.battery_mv
+
+
+class BHyveRssiSensor(_BHyveDeviceSensorBase):
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_rssi"
+        self._attr_name = "Signal strength"
+
+    @property
+    def native_value(self) -> int | None:
+        return self.coordinator.device.rssi
 
 
 class BHyveRainDelayEndsSensor(_BHyveDeviceSensorBase):
