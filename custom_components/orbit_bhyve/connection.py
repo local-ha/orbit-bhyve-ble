@@ -47,6 +47,14 @@ OPEN_MAX_ATTEMPTS = 3
 # ~30s. Cap the wait; the notification drain in send() is the real ack.
 WRITE_ACK_TIMEOUT_SEC = 0.8
 
+# Event-driven drain: the reply usually lands in 50-150ms and a status burst
+# arrives as a few frames, but an ack-then-status reply can gap ~150ms between
+# the small ack and the richer #16 status (observed 147ms in a live capture).
+# So after the first frame, keep the drain window open only until no new frame
+# has arrived for this long — returning ~4x faster than sleeping the full
+# drain_ms, without truncating a multi-frame reply. drain_ms remains the hard cap.
+NOTIF_QUIET_SEC = 0.35
+
 PostHandshakeHook = Callable[["BHyveBleConnection"], Awaitable[None]]
 PlaintextObserver = Callable[[bytes], None]
 
@@ -77,6 +85,8 @@ class BHyveBleConnection:
         self._rx_ctr: int = 0
         self._lock = asyncio.Lock()
         self._notif_buf: list[bytes] = []
+        self._notif_event = asyncio.Event()  # set on every notification; drives _drain
+        self._last_rx_frame: bytes | None = None  # last raw RX frame, for de-dup
         self._handshaken = False
         self._post_handshake_hook: PostHandshakeHook | None = None
         self._plaintext_observer: PlaintextObserver | None = None
@@ -159,45 +169,12 @@ class BHyveBleConnection:
         )
 
     async def _handshake(self) -> None:
-        """Subscribe + AES session init. Bounded by the caller; on a marginal
-        link any of these GATT ops can stall, so it must run under wait_for."""
-        # Note: tried writing the provisioning frame [0x01 0x00 || key] to
-        # NETWORK_CHAR (0x6c76) here — char is firmware-locked on every
-        # device tested ("Write not permitted"). Confirmed not the actual
-        # mechanism for fw0041 the v1 commit fad91eae assumed.
-
-        # The post-connect handshake (subscribe + AES read/write) is the part
-        # that stalls on a marginal link, so bound it — ensure_connected()
-        # retries the whole open on timeout.
-        try:
-            await asyncio.wait_for(self._handshake(), timeout=HANDSHAKE_TIMEOUT_SEC)
-        except asyncio.TimeoutError as err:
-            raise BleHandshakeError(
-                f"{self.mac}: handshake timed out after {HANDSHAKE_TIMEOUT_SEC}s"
-            ) from err
-
-        # One-shot GATT enumeration — looking for standard Battery Service
-        # (0x180F / 0x2A19) or anything else the device exposes that we
-        # haven't been using. Logged at INFO for reverse-engineering work.
-        try:
-            for service in self._client.services:
-                _LOGGER.info("%s: gatt svc %s", self.mac, service.uuid)
-                for char in service.characteristics:
-                    _LOGGER.info(
-                        "%s:   char %s props=%s",
-                        self.mac, char.uuid, list(char.properties),
-                    )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("%s: gatt enum failed: %s", self.mac, err)
-
-        if self._post_handshake_hook is not None:
-            await self._post_handshake_hook(self)
-
-    async def _handshake(self) -> None:
         """Subscribe + AES handshake. Bounded by a timeout in _open() because
-        these GATT reads/writes are what stall on a weak link."""
+        these GATT reads/writes are what stall on a weak link. The
+        post-handshake hook and open-retry are driven by _open()."""
         # Subscribe BEFORE writing — device may stay silent otherwise.
         self._notif_buf.clear()
+        self._last_rx_frame = None  # fresh CTR stream — don't dedup across sessions
         await self._client.start_notify(READ_CHAR, self._on_notify)
 
         # AES handshake. Phone forces init_tx[11]=0x00.
@@ -223,7 +200,19 @@ class BHyveBleConnection:
         Decryption advances the rx counter — necessary for the next
         notification's plaintext to be correct."""
         frame = bytes(data)
+        # Drop an exact re-delivery of the previous frame. A proxy/link can
+        # re-emit the same notification (observed: dozens of identical frames in
+        # a burst while the vendor app held the device's single BLE session). We
+        # decrypt every delivery, so a re-delivery would advance the RX counter
+        # and desync the CTR stream — poisoning every subsequent frame until the
+        # next handshake. Same plaintext at a new counter yields different
+        # ciphertext, so byte-identical consecutive frames are always dupes.
+        if frame == self._last_rx_frame:
+            _LOGGER.debug("%s: dropped duplicate rx frame %s", self.mac, frame.hex())
+            return
+        self._last_rx_frame = frame
         self._notif_buf.append(frame)
+        self._notif_event.set()  # wake any in-flight drain (see _drain)
         if not self._handshaken or self._iv is None:
             return
         try:
@@ -257,6 +246,7 @@ class BHyveBleConnection:
         self._client = None
         self._handshaken = False
         self._iv = None
+        self._last_rx_frame = None
 
     def _arm_idle_timer(self) -> None:
         if self._idle_sec <= 0:
@@ -323,14 +313,36 @@ class BHyveBleConnection:
         except asyncio.TimeoutError:
             pass
 
+    async def _drain(self, drain_ms: int) -> None:
+        """Collect the device's reply, returning as soon as it goes quiet
+        instead of always sleeping the full drain window. Wake on the first
+        notification, then hold the window open only while frames keep arriving
+        (NOTIF_QUIET_SEC between them), hard-capped at drain_ms so a silent
+        device still returns on time. Call with _notif_buf freshly cleared."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + drain_ms / 1000.0
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            # Clear before snapshotting the buffer: a frame arriving from here
+            # on re-sets the event and wakes us; a frame already buffered means
+            # we're settling and should wait only a short quiet window for more.
+            self._notif_event.clear()
+            timeout = min(NOTIF_QUIET_SEC, remaining) if self._notif_buf else remaining
+            try:
+                await asyncio.wait_for(self._notif_event.wait(), timeout)
+            except asyncio.TimeoutError:
+                return  # no new frame within the window -> reply complete (or silent)
+
     async def send(self, plaintext: bytes, *, drain_ms: int = 1500) -> list[bytes]:
-        """Encrypt + WRITE_REQ + drain notifications for `drain_ms`. Returns
-        the list of raw notification frames received."""
+        """Encrypt + WRITE_REQ + drain notifications until the reply goes quiet
+        (bounded by `drain_ms`). Returns the raw notification frames received."""
         async with self._lock:
             await self.ensure_connected()
             self._notif_buf.clear()
             await self._write_locked(plaintext)
-            await asyncio.sleep(drain_ms / 1000.0)
+            await self._drain(drain_ms)
             received = list(self._notif_buf)
             self._notif_buf.clear()
             self._arm_idle_timer()
@@ -362,7 +374,7 @@ class BHyveBleConnection:
                 await self.ensure_connected()
             self._notif_buf.clear()
             await self._write_locked(plaintext)
-            await asyncio.sleep(drain_ms / 1000.0)
+            await self._drain(drain_ms)
             received = list(self._notif_buf)
             self._notif_buf.clear()
             self._arm_idle_timer()

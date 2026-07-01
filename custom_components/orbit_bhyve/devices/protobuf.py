@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import struct
 import time
+from datetime import datetime, timedelta, timezone
 
 from .base import BHyveBleDeviceBase
 from .status import MSG_HEADER, _crc16_ccitt, apply_status_plaintext
@@ -59,6 +60,13 @@ def _build_start_pb(station_id: int, duration_sec: int) -> bytes:
 
 _STOP_PB = bytes.fromhex("720408021200")
 
+# #15 {} — empty getDeviceStatus request. Elicits a full #16 status burst even
+# mid-run (solicited RX is reliable where the unsolicited connect-time push is
+# not). This is how we read the REAL run-state after a command: the device
+# answers a start with a #16 status but answers a stop with only a bare #30 ack
+# (no #16), so without this poll a healthy stop can never be confirmed.
+_REQUEST_STATUS_PB = bytes.fromhex("7a00")
+
 
 def _build_rain_delay_pb(minutes: int, expiry: int | None) -> bytes:
     """Rain delay: #17 { #1=minutes; #3=expiryUnixUTC; #4=1 }.
@@ -89,21 +97,55 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         # not the d7-47 mesh battery parse the base class does.
         apply_status_plaintext(self, pt)
 
+    async def refresh_status(self, drain_ms: int = 1500) -> None:
+        """Send #15{} to elicit a full #16 status burst; the decoded run-state,
+        battery, seconds-remaining, and rain-delay fold into self.state via
+        _observe_plaintext. This is the canonical mid-run / post-command read —
+        solicited RX is reliable where the unsolicited push is not."""
+        if self.connection is None:
+            return
+        await self.connection.send(_build_message(_REQUEST_STATUS_PB), drain_ms=drain_ms)
+
+    async def refresh_state(self):
+        """Coordinator poll: actually read the device over BLE (#15{}) so HA
+        tracks state the device changed on its own — a scheduled PROGRAM run,
+        an app/button run, an on-device auto-close, or a rain delay expiring —
+        not just HA-issued commands. Runs on the 'Poll idle'/'Poll watering'
+        cadence. Best-effort: a failed poll leaves the last-known state rather
+        than raising, so one out-of-range moment doesn't mark the device
+        unavailable."""
+        if self.connection is not None:
+            try:
+                await self.refresh_status()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("%s: %s status poll failed: %s", self.mac, self.log_label, err)
+            self.state.is_connected = self.connection.is_connected
+        return self.state
+
     async def start_watering(self, station: int, duration_sec: int) -> bool:
         if self.connection is None:
             return False
         # Stations are 0-indexed on the wire (station 1 -> 0).
         plaintext = _build_message(_build_start_pb(station - 1, duration_sec))
-        # The command reply carries the device status, which _observe_plaintext
-        # (apply_status_plaintext) decodes into self.state.is_watering — so we
-        # confirm the device actually started, and retry once with a fresh
-        # session if it didn't.
+        # The start reply usually carries a #16 status that _observe_plaintext
+        # decodes into self.state.is_watering; if this one didn't, poll #15{} to
+        # read the real run-state before deciding. Retry once with a fresh
+        # session if still unconfirmed.
         for attempt in range(2):
             notifs = await self.connection.send(plaintext, drain_ms=2000)
             self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
+            if not self.state.is_watering:
+                await self.refresh_status()
             if self.state.is_watering:
+                now = datetime.now(timezone.utc)
                 self.state.active_zone = station
-                self.state.seconds_remaining = duration_sec
+                self.state.started_at = now
+                # Arm the wall-clock auto-close: the coordinator flips the valve
+                # closed at expected_off_at even if a later BLE read/stop fails,
+                # so it can't sit stuck-open on the device's own timer.
+                self.state.expected_off_at = now + timedelta(seconds=duration_sec)
+                if not self.state.seconds_remaining:
+                    self.state.seconds_remaining = duration_sec
                 _LOGGER.debug("%s: %s START confirmed watering", self.mac, self.log_label)
                 return True
             _LOGGER.warning(
@@ -123,9 +165,16 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         for attempt in range(2):
             notifs = await self.connection.send(plaintext, drain_ms=2000)
             self._stamp_command("stop", len(notifs))
+            # The device answers a stop with a bare #30 ack (no #16 status), so
+            # the send alone never updates is_watering. Poll #15{} to read the
+            # real run-state (idle, or run-state 3 if a rain delay is active —
+            # both are "not watering") before deciding.
+            await self.refresh_status()
             if not self.state.is_watering:
                 self.state.active_zone = None
                 self.state.seconds_remaining = None
+                self.state.started_at = None
+                self.state.expected_off_at = None
                 _LOGGER.debug("%s: %s STOP confirmed idle", self.mac, self.log_label)
                 return True
             _LOGGER.warning(
@@ -157,6 +206,9 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         plaintext = _build_message(_build_rain_delay_pb(minutes, expiry))
         notifs = await self.connection.send(plaintext, drain_ms=2000)
         self._stamp_command(f"rain_delay set {minutes}m", len(notifs))
+        # Read back the authoritative #16.#13 echo via #15{} rather than trusting
+        # the set reply's push (which the device suppresses while active).
+        await self.refresh_status()
         ok = bool(self.state.rain_delay_minutes)
         _LOGGER.log(
             logging.DEBUG if ok else logging.WARNING,
@@ -172,4 +224,6 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         plaintext = _build_message(_build_rain_delay_pb(0, None))
         notifs = await self.connection.send(plaintext, drain_ms=2000)
         self._stamp_command("rain_delay clear", len(notifs))
+        # Confirm the cleared #16.#13 echo via a #15{} read-back.
+        await self.refresh_status()
         return not self.state.rain_delay_minutes

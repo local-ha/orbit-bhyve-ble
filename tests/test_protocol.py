@@ -41,14 +41,33 @@ def test_pb_field_varint_and_bytes():
 
 # --- TX frame round-trip --------------------------------------------------
 
-def _status_pb(*, run_state=None, battery_mv=None, watering_active=None) -> bytes:
+def _status_pb(
+    *, run_state=None, battery_mv=None, watering_active=None, remaining=None,
+    active_station=None,
+) -> bytes:
     """Build a device-status protobuf the way the device would emit it, using
     the same field numbers status.py decodes."""
     out = b""
-    if run_state is not None or battery_mv is not None:
+    if (
+        run_state is not None or battery_mv is not None
+        or remaining is not None or active_station is not None
+    ):
         sub = b""
         if run_state is not None:
             sub += tx._pb_field_varint(rx.RX_F_STATUS_MODE, run_state)
+        if active_station is not None:
+            # #16.#2.#2.#3.#1 active-run echo — nest the stationId three deep.
+            station_info = tx._pb_field_varint(rx.RX_F_STATION_ID, active_station)
+            params = tx._pb_field_bytes(rx.RX_F_RUNECHO_STATION, station_info)
+            sub += tx._pb_field_bytes(
+                rx.RX_F_STATUS_RUNECHO, tx._pb_field_bytes(rx.RX_F_RUNECHO_PARAMS, params)
+            )
+        if remaining is not None:
+            # #16.#6 run-progress block carrying #7 = seconds remaining.
+            sub += tx._pb_field_bytes(
+                rx.RX_F_STATUS_PROGRESS,
+                tx._pb_field_varint(rx.RX_F_PROGRESS_REMAINING, remaining),
+            )
         if battery_mv is not None:
             sub += tx._pb_field_bytes(
                 rx.RX_F_STATUS_BATT, tx._pb_field_varint(rx.RX_F_BATT_MV, battery_mv)
@@ -125,6 +144,21 @@ def test_extract_status_running():
     assert st.run_state == 4
     assert st.is_watering is True
     assert st.battery_mv == 2644
+
+
+def test_extract_status_decodes_seconds_remaining():
+    # #16.#6.#7 carries seconds remaining while watering (hardware: 600 at start).
+    st = rx.extract_status(_status_pb(run_state=4, remaining=600))
+    assert st.run_state == 4
+    assert st.is_watering is True
+    assert st.seconds_remaining == 600
+
+
+def test_extract_status_decodes_active_station():
+    # #16.#2.#2.#3.#1 tells us which zone is running (0-indexed on the wire).
+    st = rx.extract_status(_status_pb(run_state=4, active_station=2))
+    assert st.is_watering is True
+    assert st.active_station == 2
 
 
 def test_watering_field_59_takes_precedence_over_absent_runstate():
@@ -228,6 +262,51 @@ def test_apply_sets_watering_true_on_running():
     dev.state.is_watering = False
     rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=4, battery_mv=2644)))
     assert dev.state.is_watering is True
+
+
+def test_apply_updates_seconds_remaining_while_watering():
+    # A mid-run #15 poll should refresh the live countdown, not freeze it.
+    dev = _fake_device()
+    dev.state.seconds_remaining = 600
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=4, remaining=540)))
+    assert dev.state.is_watering is True
+    assert dev.state.seconds_remaining == 540
+
+
+def test_apply_sets_active_zone_from_status():
+    # Regression for "one valve actuated but HA shows all valves": a poll- or
+    # app-discovered run must set active_zone (zone = stationId + 1) so only the
+    # running zone renders open on a multi-station device.
+    dev = _fake_device()
+    dev.state.is_watering = False
+    dev.state.active_zone = None
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=4, active_station=2)))
+    assert dev.state.is_watering is True
+    assert dev.state.active_zone == 3  # stationId 2 -> zone 3
+
+
+def test_apply_arms_expected_off_from_seconds_remaining():
+    # A poll-discovered run must arm the wall-clock auto-close so the entity
+    # counts down and closes even between polls.
+    dev = _fake_device()
+    dev.state.is_watering = False
+    dev.state.expected_off_at = None
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=4, remaining=300)))
+    assert dev.state.is_watering is True
+    assert dev.state.expected_off_at is not None
+
+
+def test_apply_clears_stale_rain_delay_on_idle_status_without_block():
+    # Regression for the "7 hours ago / still 3h" staleness: once a delay
+    # expires the device omits #16.#13, so an idle status (run-state 1) with no
+    # rain-delay block must clear the previously-set value.
+    from datetime import datetime, timezone
+    dev = _fake_device()
+    dev.state.rain_delay_minutes = 180
+    dev.state.rain_delay_ends = datetime.now(timezone.utc)
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=1)))
+    assert dev.state.rain_delay_minutes == 0
+    assert dev.state.rain_delay_ends is None
 
 
 def test_apply_rejects_out_of_band_battery():

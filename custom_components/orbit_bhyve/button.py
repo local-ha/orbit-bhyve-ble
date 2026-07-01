@@ -1,14 +1,15 @@
 """Button platform — per-device sync button.
 
 One ButtonEntity per non-hub device. Pressing it forces a fresh BLE
-connect + 8-step init; the info-ack notification that arrives during
-init carries battery_mV (parsed by devices.base.BHyveBleDeviceBase
-._observe_plaintext), and the coordinator refresh after the press
-pushes the new value into HA.
+connect + 8-step init, then requests a coordinator refresh — which for
+protobuf devices issues a solicited #15 status read (real run-state,
+battery, rain-delay, seconds-remaining), the reliable way to pull live
+state on demand (e.g. to see a program run the poll hasn't caught yet).
+Mesh devices fall back to the connect-time push (battery).
 
-Equivalent to calling the orbit_bhyve.probe_status service, but
-attached to the device card so a non-technical user can refresh battery
-without going through Developer Tools.
+Equivalent to a manual, on-demand version of the periodic status poll,
+attached to the device card so a non-technical user can refresh without
+going through Developer Tools.
 """
 from __future__ import annotations
 

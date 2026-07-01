@@ -46,7 +46,10 @@ CONF_POLL_WATERING = "poll_watering_sec"
 
 DEFAULT_DURATION = 600
 DEFAULT_IDLE_DISCONNECT = 60
-DEFAULT_POLL_IDLE = 300
+DEFAULT_POLL_IDLE = 900  # 15 min — an idle status poll (#15) connects over BLE, so keep
+                         # the cadence gentle on the AA-powered valves; most program runs
+                         # last longer and get picked up at least once. Tunable in the
+                         # Configure dialog (Poll idle).
 DEFAULT_POLL_WATERING = 30
 
 # Stored shape per device under entry.data["devices"]:
