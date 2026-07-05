@@ -490,6 +490,56 @@ def test_connected_false_on_failed_poll():
     assert dev.connection.disconnects == 1
 
 
+# --- no-status polls aren't phantom successes; over-the-air wedge recovery ----
+
+def test_poll_without_status_is_not_a_success():
+    # A poll that CONNECTS but decodes no #16 (a wedge recovery couldn't clear
+    # this cycle) must NOT stamp a phantom "successful poll" — that false success
+    # is exactly what masked frozen battery on the stuck valves. It counts as a
+    # timeout so the diagnostic sensors surface it.
+    dev = _make_device(is_watering=False, consecutive_timeouts=2)
+    dev.connection = _FakeConn(dev, on_status=None, on_command=None)  # device silent
+    state = asyncio.run(dev.refresh_state())
+    assert state.last_successful_poll is None
+    assert state.consecutive_timeouts == 3
+    assert state.is_connected is True  # reached the device, just got no data
+
+
+class _IgnoresStatusQueryConn(_FakeConn):
+    """Models a unit (BTValve04) that ignores the passive #15 getDeviceStatus
+    query outright but DOES echo a full #16 in reply to a setRainDelay (#17)
+    write — the on_command frame is fed only for the rain-delay no-op."""
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        self.sent.append(frame)
+        rd_noop = pb._build_message(pb._build_rain_delay_pb(0, None))
+        if frame == rd_noop and self.on_command is not None:
+            self.device._observe_plaintext(self.on_command)
+        return [b"\x01"]
+
+
+def test_recovers_status_via_rain_delay_noop_when_15_ignored():
+    # When #15 is ignored, recovery falls back to a benign #17 no-op that echoes
+    # the #16 status — turning a phantom-failed poll into a real success.
+    dev = _make_device(is_watering=False)
+    dev.connection = _IgnoresStatusQueryConn(dev, on_status=None, on_command=_status_frame(1))
+    state = asyncio.run(dev.refresh_state())
+    assert getattr(dev, "_status_parsed", False) is True
+    assert state.last_successful_poll is not None            # now a genuine success
+    assert pb._build_message(pb._build_rain_delay_pb(0, None)) in dev.connection.sent
+
+
+def test_status_recovery_noop_never_wipes_active_rain_delay():
+    # The #16-eliciting write must RE-ASSERT an active rain delay (a no-op), never
+    # send a bare clear that would silently cancel it.
+    ends = datetime.now(timezone.utc) + timedelta(hours=1)
+    dev = _make_device(is_watering=False, rain_delay_minutes=60, rain_delay_ends=ends)
+    frame = pb._build_message(dev._noop_rain_delay_pb())
+    rd = rx.pb_parse(rx._pb_field(rx.pb_parse(rx.decode_inner(frame)), 17))
+    assert rx._pb_field(rd, rx.RX_F_RD_MINUTES) == 60
+    assert rx._pb_field(rd, rx.RX_F_RD_EXPIRY) == int(ends.timestamp())
+
+
 # --- multi-frame-safe CTR self-heal (A2) -----------------------------------
 
 class _FakeHass:

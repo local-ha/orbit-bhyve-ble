@@ -150,20 +150,67 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             except Exception:  # noqa: BLE001
                 pass
         await self.connection.send(_build_message(_REQUEST_STATUS_PB), drain_ms=drain_ms)
-        # If we still got no status block, retry once with a longer drain window.
-        if self.has_flow and not self._status_parsed:
-            _LOGGER.debug(
-                "%s: refresh_status got no status block — trying reactive unsubscribe", self.mac
-            )
+        if self._status_parsed:
+            return
+        # Connected, but the device returned no #16. Two hardware-observed causes,
+        # both of which leave the BLE link healthy (so the poll otherwise looks
+        # "successful") yet update nothing — battery, run-state, everything stays
+        # frozen on whatever was last known (e.g. the initial cloud snapshot):
+        #   1. A persistent #57 flow subscription (left in device flash by an
+        #      interrupted flow read) streams #59 on every connect, starving the
+        #      #16 reply AND desyncing the pooled RX counter. A same-session retry
+        #      can't recover — only a fresh handshake re-bases the counter.
+        #   2. Some units simply don't answer the passive #15 query at all, but DO
+        #      echo a full #16 in reply to a benign setRainDelay write.
+        # Recover both over the air so a REMOTE operator never needs a physical
+        # battery pull (HW-verified un-wedging BTValve01 (cause 1) and BTValve04
+        # (cause 2) with no site visit).
+        _LOGGER.debug("%s: refresh_status got no status block — recovering", self.mac)
+        await self._recover_status(drain_ms)
+
+    async def _recover_status(self, drain_ms: int) -> None:
+        """Best-effort recovery for a poll that connected but decoded no #16.
+        Never raises — a failed recovery leaves the prior state untouched."""
+        if self.connection is None:
+            return
+        for attempt in range(2):
             try:
+                # Fresh handshake re-bases the RX counter, clearing a connect-time
+                # #59-stream desync from a persistent subscription.
+                await self.connection.disconnect()
+                if self.has_flow:
+                    # Subscribe to catch the stream while it's synced, THEN
+                    # unsubscribe to both stop it and clear the flash subscription.
+                    # A cold unsubscribe on a desynced session doesn't take;
+                    # subscribing first (which resyncs) is what makes the
+                    # unsubscribe land — HW-proven on a stuck BTValve01.
+                    await self.connection.send(_build_message(_FLOW_SUBSCRIBE_PB), drain_ms=1500)
+                    await self.connection.send(_build_message(_FLOW_UNSUBSCRIBE_PB), drain_ms=800)
+                await self.connection.send(_build_message(_REQUEST_STATUS_PB), drain_ms=drain_ms)
+                if self._status_parsed:
+                    return
+                # #15 still silent: this unit ignores the passive query. A
+                # setRainDelay write echoes the full #16 status. Re-assert the
+                # CURRENTLY known rain-delay state so the write is a no-op that can
+                # never wipe an active delay (bare clear only when none is set).
                 await self.connection.send(
-                    _build_message(_FLOW_UNSUBSCRIBE_PB), drain_ms=800
+                    _build_message(self._noop_rain_delay_pb()), drain_ms=drain_ms
                 )
-                await self.connection.send(
-                    _build_message(_REQUEST_STATUS_PB), drain_ms=drain_ms
+                if self._status_parsed:
+                    return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "%s: status recovery attempt %d failed: %s", self.mac, attempt + 1, err
                 )
-            except Exception:  # noqa: BLE001
-                pass
+
+    def _noop_rain_delay_pb(self) -> bytes:
+        """A setRainDelay (#17) payload that re-asserts the currently known
+        rain-delay state, so sending it is a no-op whose only effect is to elicit
+        the #16 status echo — used to read status from units that ignore #15."""
+        mins = self.state.rain_delay_minutes or 0
+        if mins > 0 and self.state.rain_delay_ends is not None:
+            return _build_rain_delay_pb(mins, int(self.state.rain_delay_ends.timestamp()))
+        return _build_rain_delay_pb(0, None)
 
     async def read_flow(self) -> None:
         """Spot-check the flow sensor and set state.flow_gpm (instantaneous rate).
@@ -236,18 +283,32 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             if self.connection is not None:
                 try:
                     await self.refresh_status()
-                    self.state.last_successful_poll = datetime.now(timezone.utc)
-                    self.state.consecutive_timeouts = 0
                     # "Connected" tracks whether the last poll REACHED the device,
                     # not the momentary BLE link — under the ephemeral model we
                     # disconnect immediately below, so the live link is always down
-                    # between polls. Poll-reachability is the meaningful signal and
-                    # stays coherent with consecutive_timeouts.
+                    # between polls. Poll-reachability is the meaningful signal.
                     self.state.is_connected = True
-                    # Flow only means anything mid-run; poll it (Gen2 only) once a
-                    # run is confirmed so the reading tracks the active watering.
-                    if self.has_flow and self.state.is_watering:
-                        await self._read_flow_locked()
+                    if getattr(self, "_status_parsed", False):
+                        # A real #16 was decoded this cycle: this is a genuinely
+                        # successful poll.
+                        self.state.last_successful_poll = datetime.now(timezone.utc)
+                        self.state.consecutive_timeouts = 0
+                        # Flow only means anything mid-run; poll it (Gen2 only)
+                        # once a run is confirmed so the reading tracks watering.
+                        if self.has_flow and self.state.is_watering:
+                            await self._read_flow_locked()
+                    else:
+                        # Reached the device but it returned NO status (a wedge
+                        # recovery couldn't clear this cycle). Do NOT stamp a
+                        # phantom "successful poll" — that false success is exactly
+                        # what masked frozen battery for a whole deploy. Count it so
+                        # the diagnostic sensors (Last successful poll / Consecutive
+                        # timeouts) surface the problem instead of hiding it.
+                        self.state.consecutive_timeouts += 1
+                        _LOGGER.debug(
+                            "%s: %s poll reached device but got no status (%d consecutive)",
+                            self.mac, self.log_label, self.state.consecutive_timeouts,
+                        )
                 except Exception as err:  # noqa: BLE001
                     self.state.consecutive_timeouts += 1
                     self.state.is_connected = False
