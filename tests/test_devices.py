@@ -356,6 +356,55 @@ def test_read_flow_always_unsubscribes():
     assert dev.connection.sent[-1] == pb._build_message(pb._FLOW_UNSUBSCRIBE_PB)
 
 
+class _FlowCancelConn:
+    """A flow connection that never feeds samples, so read_flow parks in its
+    sample-sleep loop and can be cancelled there — exposing what the finally does
+    under an HA-restart-style cancellation. Tracks reconnects and sends."""
+
+    def __init__(self):
+        self.sent: list[bytes] = []
+        self.ensure_connected_calls = 0
+        self.disconnects = 0
+        self._connected = True
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        self.sent.append(frame)
+        return [b"\x01"]
+
+    async def ensure_connected(self):
+        self.ensure_connected_calls += 1
+        self._connected = True
+
+    async def disconnect(self):
+        self.disconnects += 1
+        self._connected = False
+
+    @property
+    def is_connected(self):
+        return self._connected
+
+
+def test_read_flow_cancelled_does_not_reconnect():
+    # An HA restart/unload can cancel read_flow mid-sample. Its finally must NOT
+    # reconnect (that races the teardown and fights the device's single-session
+    # limit) — it only unsubscribes if the session is still up, and the shielded
+    # write still lands so no #59 stream is left behind.
+    dev = _make_device(is_watering=True)
+    conn = _FlowCancelConn()
+    dev.connection = conn
+
+    async def run():
+        task = asyncio.create_task(dev.read_flow())
+        await asyncio.sleep(0.05)  # let it reach the sample sleep
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert conn.ensure_connected_calls == 0  # never reconnected from the finally
+    assert conn.sent[-1] == pb._build_message(pb._FLOW_UNSUBSCRIBE_PB)  # still unsubscribed
+
+
 def test_refresh_state_subscribes_flow_while_watering():
     # A Gen2 poll that finds a run in progress should also spot-check flow so the
     # gauge tracks live: the #57 subscribe is issued and flow_gpm is computed.

@@ -259,17 +259,27 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 )
                 await self.connection.disconnect()
         finally:
-            # Cancel the stream so the next poll's #15 gets a clean #16 (and so we
-            # don't wedge the valve). Guaranteed delivery: reconnect if we dropped.
-            try:
-                if self.connection is not None:
-                    if not self.connection.is_connected:
-                        await self.connection.ensure_connected()
-                    await self.connection.send(
-                        _build_message(_FLOW_UNSUBSCRIBE_PB), drain_ms=500
+            # Cancel the stream so the next poll's #15 gets a clean #16. This
+            # finally also runs under task CANCELLATION (an HA restart/unload mid
+            # read), so it must be cancellation-safe:
+            #  - never reconnect from here — on a teardown a reconnect races the
+            #    unload and fights the device's single-BLE-session limit (and can
+            #    hang), so only unsubscribe if the session is STILL up;
+            #  - shield the write so a cancellation delivers it instead of dropping
+            #    it mid-flight (CancelledError is a BaseException — it would slip
+            #    past the BleakError/Exception guard otherwise).
+            # A leaked subscription is no longer sticky regardless: _recover_status
+            # self-heals it on a later poll.
+            conn = self.connection
+            if conn is not None and conn.is_connected:
+                try:
+                    await asyncio.shield(
+                        conn.send(_build_message(_FLOW_UNSUBSCRIBE_PB), drain_ms=500)
                     )
-            except (BleakError, Exception) as err:
-                _LOGGER.debug("%s: resilient flow unsubscribe ignored loss: %s", self.mac, err)
+                except asyncio.CancelledError:
+                    _LOGGER.debug("%s: flow unsubscribe shielded through cancellation", self.mac)
+                except (BleakError, Exception) as err:  # noqa: BLE001
+                    _LOGGER.debug("%s: flow unsubscribe ignored loss: %s", self.mac, err)
 
     async def refresh_state(self):
         """Coordinator poll: actually read the device over BLE (#15{}) so HA
