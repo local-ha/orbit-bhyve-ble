@@ -156,6 +156,18 @@ def test_extract_status_decodes_seconds_remaining():
     assert st.seconds_remaining == 600
 
 
+def test_extract_status_decodes_seconds_remaining_gen2():
+    # Gen2 carries seconds remaining in #16.#7.#6
+    sub = tx._pb_field_varint(1, 4) + tx._pb_field_bytes(
+        7, tx._pb_field_varint(6, 450)
+    )
+    pb_data = tx._pb_field_bytes(16, sub)
+    st = rx.extract_status(pb_data)
+    assert st.run_state == 4
+    assert st.is_watering is True
+    assert st.seconds_remaining == 450
+
+
 def test_extract_status_decodes_active_station():
     # #16.#2.#2.#3.#1 tells us which zone is running (0-indexed on the wire).
     st = rx.extract_status(_status_pb(run_state=4, active_station=2))

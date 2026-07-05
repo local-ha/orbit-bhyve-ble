@@ -104,6 +104,18 @@ poll, so you can tune them mid-run without disturbing an active watering. (The
 options *form* itself only appears after the first restart that installs a new
 version.)
 
+### Battery Impact & Polling Cadences
+
+Because Orbit B-Hyve valves run on 2× AA batteries (roughly ~2,500–3,000 mAh capacity), every BLE poll involves ~1.5–2 seconds of radio activity (~12 mA average current during connection). To balance responsiveness against battery life, the integration uses two separate polling schedules:
+
+| Cadence Mode | Default Interval | Connections / Hour | Est. Battery Consumption | Expected AA Battery Life |
+| :--- | :--- | :--- | :--- | :--- |
+| **Passive (Idle)** | 900 seconds (15 min) | ~4 conns / hr | ~0.02 mAh / hour | **12+ months** (normal standby) |
+| **Active (Watering)** | 60 seconds (1 min) | ~60 conns / hr | ~0.35 mAh / hour | **Negligible impact** during typical runs (~0.7 mAh for a 2-hr run; < 0.03% of total battery capacity) |
+
+> [!TIP]
+> If you rely heavily on live flow gauges or rapid auto-close tracking during long watering sessions, you can safely tighten the **Watering** poll interval to 30 seconds without noticeably degrading seasonal battery life. For **Idle** periods, keeping the interval at 900 seconds (or higher) is recommended to maximize battery longevity.
+
 ## Cumulative water usage (Integration helper)
 
 The **Flow rate** sensor is an instantaneous rate, not a totalizer — the device's
@@ -129,15 +141,8 @@ want finer resolution (at some battery cost).
 
 1. **Setup**: log into Orbit cloud once → fetch device list → fetch one AES
    network key per mesh → cache everything in the config entry
-2. **Per command**: the integration's pooled BLE connection (one per device)
-   does an AES handshake, runs the model-specific init sequence on first
-   connect, then sends one encrypted frame per command and reads back
-   notifications
-3. **Reuse**: the connection stays open across commands until idle timeout.
-   Watering commands re-run the model init/bind first — the device silently
-   ignores a watering frame sent on a stale bind — while reads reuse the
-   pooled session directly. Marginal proxy links get a bounded handshake with
-   a few clean retries instead of a wedged connection.
+2. **Connect-on-Demand (Ephemeral)**: whenever a command is sent or a scheduled status poll occurs, the integration opens a fresh BLE connection, completes the AES-128 handshake and model init sequence, sends the encrypted frame, and reads back the confirmation.
+3. **Radio & Proxy Release**: as soon as the command or status read completes, the BLE connection is cleanly closed (`disconnect`). This prevents proxy slot starvation on ESPHome devices, eliminates cryptographic counter desynchronization from stale sessions, and spares valve batteries. Marginal proxy links get a bounded handshake with a few clean retries instead of a wedged connection.
 
 The cipher (AES-128-ECB used as a CTR-style keystream, frame trailer =
 `sum(plaintext) + magic + len`) was reverse-engineered against captured

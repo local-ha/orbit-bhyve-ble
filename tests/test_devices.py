@@ -149,6 +149,24 @@ def test_stop_confirms_via_status_poll_when_reply_lacks_status():
     assert pb._build_message(pb._REQUEST_STATUS_PB) in dev.connection.sent
 
 
+def test_stop_confirms_immediately_via_stop_ack():
+    # If the stop command response contains the #30 stop command acknowledgment,
+    # it must confirm the stop immediately and bypass/skip needing status poll confirmations.
+    dev = _make_device(is_watering=True, active_zone=1, seconds_remaining=600)
+    dev.state.expected_off_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    
+    stop_ack = pb._pb_field_bytes(30, b"\x08\x01")
+    stop_ack_frame = pb._build_message(stop_ack)
+    
+    dev.connection = _FakeConn(dev, on_status=None, on_command=stop_ack_frame)
+    
+    ok = asyncio.run(dev.stop_watering())
+    
+    assert ok is True
+    assert dev.state.is_watering is False
+    assert dev.state.expected_off_at is None
+
+
 def test_stop_not_confirmed_when_device_still_watering():
     # If the #15{} poll still shows run-state 4, the stop must NOT falsely
     # confirm — it retries with a fresh session and reports failure.
@@ -228,7 +246,8 @@ def test_set_rain_delay_anchors_expiry_to_device_clock():
 
     assert ok is True
     status_req = pb._build_message(pb._REQUEST_STATUS_PB)
-    rd_frames = [f for f in dev.connection.sent if f != status_req]
+    unsub_req = pb._build_message(pb._FLOW_UNSUBSCRIBE_PB)
+    rd_frames = [f for f in dev.connection.sent if f != status_req and f != unsub_req]
     assert len(rd_frames) == 1
     rd_pb = rx.pb_parse(rx._pb_field(rx.pb_parse(rx.decode_inner(rd_frames[0])), 17))
     assert rx._pb_field(rd_pb, rx.RX_F_RD_MINUTES) == minutes
@@ -316,7 +335,7 @@ def test_read_flow_resyncs_after_desynced_session():
     assert dev.connection.disconnects == 1
     assert dev.state.flow_gpm == 0.0  # a decodable #59 (flow 0 here) was committed
     n_sub = dev.connection.sent.count(pb._build_message(pb._FLOW_SUBSCRIBE_PB))
-    assert n_sub == 2 * pb._FLOW_SAMPLE_CYCLES  # both attempts subscribed
+    assert n_sub == 2  # both attempts subscribed exactly once
 
 
 def test_read_flow_no_reconnect_when_healthy():
@@ -412,3 +431,107 @@ def test_drain_returns_early_after_reply_goes_quiet():
     elapsed = asyncio.run(run())
     assert elapsed < 1.0            # returned well before the 2s cap
     assert conn._notif_buf         # the frame is retained for the caller
+
+
+def test_device_state_health_metrics():
+    state = DeviceState()
+    assert state.last_successful_poll is None
+    assert state.consecutive_timeouts == 0
+    now = datetime.now(timezone.utc)
+    state.last_successful_poll = now
+    state.consecutive_timeouts += 1
+    assert state.last_successful_poll == now
+    assert state.consecutive_timeouts == 1
+
+
+def test_configurable_gatt_settle_ms():
+    assert BHyveHT25G2Device.GATT_SETTLE_MS == 300
+    assert BHyveHT34ADevice.GATT_SETTLE_MS == 300
+
+
+# --- Connected = poll reachability (A1) ------------------------------------
+
+class _RaisingConn:
+    """A connection whose status send always fails, to exercise the poll-failure
+    path in refresh_state."""
+
+    def __init__(self):
+        self.disconnects = 0
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        raise RuntimeError("boom")
+
+    async def disconnect(self):
+        self.disconnects += 1
+
+    @property
+    def is_connected(self):
+        return False
+
+
+def test_connected_true_on_successful_poll():
+    # A poll that reads a clean #16 marks the device reachable and resets timeouts.
+    dev = _make_device(is_watering=False, consecutive_timeouts=3)
+    dev.connection = _FakeConn(dev, on_status=_status_frame(1), on_command=None)
+    state = asyncio.run(dev.refresh_state())
+    assert state.is_connected is True
+    assert state.consecutive_timeouts == 0
+    assert dev.connection.disconnects >= 1  # ephemeral teardown
+
+
+def test_connected_false_on_failed_poll():
+    # A poll whose status read raises marks the device unreachable (not a stale
+    # "connected"), increments the timeout counter, and still disconnects cleanly.
+    dev = _make_device(is_watering=False, is_connected=True)
+    dev.connection = _RaisingConn()
+    state = asyncio.run(dev.refresh_state())
+    assert state.is_connected is False
+    assert state.consecutive_timeouts == 1
+    assert dev.connection.disconnects == 1
+
+
+# --- multi-frame-safe CTR self-heal (A2) -----------------------------------
+
+class _FakeHass:
+    def __init__(self):
+        self.jobs: list = []
+
+    def add_job(self, target, *args):
+        self.jobs.append(target)
+
+
+def _handshaken_conn() -> tuple[BHyveBleConnection, _FakeHass]:
+    conn = _make_conn()
+    conn._handshaken = True
+    conn._iv = b"\x00" * 12
+    conn._rx_ctr = 0
+    hass = _FakeHass()
+    conn.hass = hass
+    return conn, hass
+
+
+def _frame_decrypting_to(conn: BHyveBleConnection, pt: bytes, ctr: int) -> bytes:
+    """Build an RX frame that conn.decrypt() (at rx_ctr==ctr) recovers to `pt`."""
+    ks, _ = conn._aes_keystream(ctr, (len(pt) + 15) // 16)
+    ct = bytes(b ^ k for b, k in zip(pt, ks[: len(pt)]))
+    return bytes([conn._frame_magic, len(ct)]) + ct + b"\x00\x00"
+
+
+def test_ctr_selfheal_on_bad_first_frame():
+    # A garbage first frame (bad inner header) is a real CTR desync → self-heal.
+    conn, hass = _handshaken_conn()
+    frame = _frame_decrypting_to(conn, b"\xd0\x18\x29\x07deadbeef", 0)
+    conn._on_notify(None, frame)
+    assert len(hass.jobs) == 1  # disconnect scheduled
+
+
+def test_ctr_selfheal_ignores_bad_continuation_frame():
+    # A valid header frame first, then a non-header CONTINUATION frame (as a long
+    # CTR-streamed reply would produce). The continuation must NOT trip the
+    # self-heal — only the reply's first frame is required to carry the header.
+    conn, hass = _handshaken_conn()
+    good = _frame_decrypting_to(conn, rx.MSG_HEADER + b"\x00" * 8, 0)
+    conn._on_notify(None, good)             # first frame: header ok, buffered
+    cont = _frame_decrypting_to(conn, b"\x11\x22\x33\x44moredata", conn._rx_ctr)
+    conn._on_notify(None, cont)             # continuation: bad header, not first
+    assert hass.jobs == []                  # no disconnect scheduled
