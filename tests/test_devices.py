@@ -78,6 +78,22 @@ def test_mv_to_pct(mv, pct):
     assert _mv_to_pct(mv) == pct
 
 
+def test_cloud_battery_snapshot_is_not_seeded():
+    # The cloud battery snapshot must NEVER seed the sensor: it's on a different
+    # discharge curve than _mv_to_pct, so it painted a wrong (voltage-inconsistent)
+    # value into long-term stats at every startup. Battery starts unknown and is
+    # only ever set by a live BLE decode.
+    record = {
+        "cloud_id": "abc", "name": "T", "mac": "AA:BB:CC:DD:EE:FF",
+        "hardware": "HT25G2-0001", "firmware": "0111", "stations": 1,
+        "network_key": "",  # no key -> no BLE connection created (no hass needed)
+        "battery_pct": 88, "battery_mv": 2999,  # cloud snapshot — must be ignored
+    }
+    dev = BHyveHT25G2Device(None, record)
+    assert dev.battery_pct is None
+    assert dev.battery_mv is None
+
+
 # --- actuation confirm-via-#15 (regression for stuck-open valve) ----------
 
 def _status_frame(run_state: int) -> bytes:

@@ -78,8 +78,16 @@ class BHyveBleDeviceBase(abc.ABC):
         self.mesh_device_id: int | None = record.get("mesh_device_id")
         self.bridge_device_id: str | None = record.get("bridge_device_id")
         self.hub_mesh_device_id: int | None = record.get("hub_mesh_device_id")
-        self.battery_pct: int | None = record.get("battery_pct")
-        self.battery_mv: int | None = record.get("battery_mv")
+        # Battery is read LIVE over BLE (#16.#14.#3 / mesh info-ack) and is the
+        # only source we trust. Deliberately NOT seeded from the cloud snapshot in
+        # `record`: the cloud reports on a chemistry-aware discharge curve that
+        # disagrees with our linear _mv_to_pct (esp. for NiMH), so seeding it
+        # painted a wrong value — inconsistent with the voltage sensor — into the
+        # battery sensor's long-term statistics at every startup, until the first
+        # poll replaced it. Start unknown; apply_status_plaintext fills these in
+        # from the device on the first successful poll.
+        self.battery_pct: int | None = None
+        self.battery_mv: int | None = None
         self.network_key: str = record["network_key"]
         self.state = DeviceState()
         # Optional callback a coordinator registers so an out-of-band state
