@@ -210,6 +210,12 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
                 rd_active = rd_minutes > 0
             else:
                 rd_active = None
+            # Run-state is authoritative. #16.#13 is NOT cleared when a delay expires —
+            # it lingers stale as {#1:mins, #3:<past>, #4:1} (HW-verified 2026-07-05, both
+            # families), so the block alone would report a phantom active delay. A
+            # run-state other than 3 (rain-delay) means no delay is active, period.
+            if run_state is not None and run_state != 3:
+                rd_active = False
 
     if battery_mv is None:                         # standalone #46.#3
         battery_mv = _pb_subfield(top, RX_F_BATTERY_REPORT, RX_F_BATT_MV)
@@ -318,10 +324,11 @@ def apply_status_plaintext(device, pt: bytes) -> None:
             device.state.rain_delay_minutes = 0
             device.state.rain_delay_ends = None
     elif st.run_state is not None and st.run_state != 3:
-        # A full status whose run-state is not rain-delay (3) and which carries
-        # NO #16.#13 block means no delay is active — the device omits the block
-        # once a delay expires or is cleared. Clear any stale value so the number
-        # / "ends" don't linger after expiry (the "7 hours ago" bug).
+        # Run-state says not rain-delayed and this status carried no #16.#13 block.
+        # (When a block IS present, extract_status already forces rain_delay_active
+        # False for run-state != 3 — the device does NOT clear #16.#13 on expiry, it
+        # lingers stale.) Clear any stale value so the number / "ends" don't linger
+        # after expiry (the "7 hours ago" bug).
         device.state.rain_delay_minutes = 0
         device.state.rain_delay_ends = None
 

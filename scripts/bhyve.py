@@ -499,6 +499,11 @@ def extract_status(protobuf):
                 rd_active = rd_minutes > 0
             else:
                 rd_active = None
+            # Run-state is authoritative: #16.#13 is NOT cleared on expiry (it lingers
+            # stale as {#1:mins,#3:<past>,#4:1}; HW-verified 2026-07-05), so a run-state
+            # other than 3 (rain-delay) means no delay is active regardless of the block.
+            if run_state is not None and run_state != 3:
+                rd_active = False
 
     if battery_mv is None:                         # standalone #46.#3
         battery_mv = _pb_subfield(top, RX_F_BATTERY_REPORT, RX_F_BATT_MV)

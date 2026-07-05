@@ -196,6 +196,24 @@ def test_extract_status_decodes_device_clock():
     assert st.device_clock == 1_700_000_000
 
 
+def test_extract_status_stale_raindelay_cleared_by_runstate():
+    # #16.#13 is NOT cleared when a delay expires — it lingers stale ({#1:60, #4:1})
+    # while run-state has returned to idle (HW-verified 2026-07-05). Run-state is
+    # authoritative: run-state != 3 => not active, regardless of the stale block.
+    rd = tx._pb_field_varint(rx.RX_F_RD_MINUTES, 60) + tx._pb_field_varint(rx.RX_F_RD_ENABLED, 1)
+    sub_idle = tx._pb_field_varint(rx.RX_F_STATUS_MODE, 1)  # idle
+    sub_idle += tx._pb_field_bytes(rx.RX_F_STATUS_RAINDELAY, rd)
+    st_idle = rx.extract_status(tx._pb_field_bytes(rx.RX_F_STATUS, sub_idle))
+    assert st_idle.run_state == 1
+    assert st_idle.rain_delay_active is False
+    # With run-state 3 (rain-delay) the same block IS honored as active.
+    sub_rd = tx._pb_field_varint(rx.RX_F_STATUS_MODE, 3)
+    sub_rd += tx._pb_field_bytes(rx.RX_F_STATUS_RAINDELAY, rd)
+    st_active = rx.extract_status(tx._pb_field_bytes(rx.RX_F_STATUS, sub_rd))
+    assert st_active.rain_delay_active is True
+    assert st_active.rain_delay_minutes == 60
+
+
 def test_watering_field_59_does_not_drive_is_watering():
     # #59.#1 (flow-active) must NOT set is_watering — only #16.#1 is authoritative.
     # A #59-asserted "watering" latched HA on when #16 reads were starved by the
