@@ -175,6 +175,20 @@ def test_extract_status_decodes_active_station():
     assert st.active_station == 2
 
 
+def test_extract_status_watering_status_30_enum():
+    # #30 WateringStatus (no #16): terminal states + a bare #30 => not watering;
+    # in-progress / delay states => a run is still active (must not idle the valve).
+    complete = tx._pb_field_bytes(30, tx._pb_field_varint(1, 1))   # our observed stop reply
+    assert rx.extract_status(complete).is_watering is False
+    station_complete = tx._pb_field_bytes(30, tx._pb_field_varint(1, 4))
+    assert rx.extract_status(station_complete).is_watering is False
+    bare = tx._pb_field_bytes(30, b"")                              # #30 with no #1
+    assert rx.extract_status(bare).is_watering is False
+    for code in (2, 3, 5, 6, 7):                                    # inProgress + delays
+        pb_data = tx._pb_field_bytes(30, tx._pb_field_varint(1, code))
+        assert rx.extract_status(pb_data).is_watering is True, code
+
+
 def test_extract_status_decodes_device_clock():
     # #7 (top-level wrapper) is the device's own Unix clock, used to anchor the
     # rain-delay absolute expiry to the device rather than the host.

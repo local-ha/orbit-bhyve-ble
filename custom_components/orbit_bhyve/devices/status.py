@@ -43,6 +43,12 @@ RX_F_BATTERY_REPORT = 46  # standalone battery report { #3 = mV }
 RX_F_WATERING = 59        # watering/flow status { #1 flow-active, #2 seq, #3 cumulative }
 RX_F_WATERING_ACTIVE = 1  #   #59.#1: water CURRENTLY flowing (not "valve open")
 RX_F_FLOW_TOTAL = 3       #   #59.#3: CUMULATIVE volume counter for this run (Gen2)
+RX_F_WATERING_STATUS = 30  # WateringStatus notification { #1 = status enum } — the "stop ack"
+RX_F_WSTATUS_CODE = 1      #   #30.#1: 1=complete, 2=inProgress, 3=pumpDelay, 4=stationComplete,
+                           #   5=stationDelay, 6=programPreDelay, 7=programPostDelay
+                           #   (enum per knobunc's PROTOCOL_SPEC; 1=complete corroborated by our
+                           #   own stop reply #30{#1=1}). Terminal/absent => not watering.
+RX_WSTATUS_ACTIVE = (2, 3, 5, 6, 7)  # in-progress + delay states = a run is still active
 
 
 def _crc16_ccitt(data: bytes, init: int = 0) -> int:
@@ -210,11 +216,16 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
     # contributes only the flow counter below.
     if run_state is not None:
         is_watering = run_state == 4
-    elif _pb_field(top, 30) is not None:
-        # A #30 block is the stop command acknowledgment; if present, the valve
-        # is closing/closed. Set is_watering=False immediately rather than waiting
-        # for a subsequent status poll.
-        is_watering = False
+    elif _pb_field(top, RX_F_WATERING_STATUS) is not None:
+        # A #30 WateringStatus notification (the "stop ack") arrives without a #16.
+        # Decode its status enum instead of blindly idling on any #30: terminal
+        # states (1=complete, 4=stationComplete) and a bare #30 mean not watering
+        # — our observed stop reply is #30{#1=1}=complete — while in-progress/delay
+        # states (2,3,5,6,7) mean a run is still active, so we must NOT idle the valve
+        # on those. (Enum per knobunc's PROTOCOL_SPEC; the non-terminal codes aren't
+        # yet observed here, so this only *refines* the old "any #30 => idle".)
+        ws = _pb_subfield(top, RX_F_WATERING_STATUS, RX_F_WSTATUS_CODE)
+        is_watering = ws in RX_WSTATUS_ACTIVE
     flow_total = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_TOTAL)   # #59.#3 cumulative
 
     return DeviceStatus(
