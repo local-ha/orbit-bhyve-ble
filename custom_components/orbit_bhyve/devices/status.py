@@ -172,9 +172,17 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
             sfields, RX_F_STATUS_RUNECHO, RX_F_RUNECHO_PARAMS,
             RX_F_RUNECHO_STATION, RX_F_STATION_ID,
         )
-        seconds_remaining = _pb_subfield(  # #16.#6.#7
-            sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_REMAINING
-        )
+        seconds_remaining = _pb_field(sfields, RX_F_PROGRESS_REMAINING)
+        if not isinstance(seconds_remaining, int):
+            seconds_remaining = _pb_subfield(  # XD: #16.#6.#7
+                sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_REMAINING
+            )
+        if not isinstance(seconds_remaining, int):
+            seconds_remaining = _pb_subfield(  # Gen2: #16.#7.#6
+                sfields, RX_F_PROGRESS_REMAINING, RX_F_STATUS_PROGRESS
+            )
+        if not isinstance(seconds_remaining, int):
+            seconds_remaining = None
         rd = _pb_field(sfields, RX_F_STATUS_RAINDELAY)   # #16.#13
         if isinstance(rd, (bytes, bytearray)):
             rdf = pb_parse(rd)
@@ -202,6 +210,11 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
     # contributes only the flow counter below.
     if run_state is not None:
         is_watering = run_state == 4
+    elif _pb_field(top, 30) is not None:
+        # A #30 block is the stop command acknowledgment; if present, the valve
+        # is closing/closed. Set is_watering=False immediately rather than waiting
+        # for a subsequent status poll.
+        is_watering = False
     flow_total = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_TOTAL)   # #59.#3 cumulative
 
     return DeviceStatus(
@@ -245,6 +258,8 @@ def apply_status_plaintext(device, pt: bytes) -> None:
 
     if st.is_watering is not None:
         device.state.is_watering = st.is_watering
+        if hasattr(device, "_status_parsed"):
+            device._status_parsed = True
         if st.is_watering:
             # Which zone is running (#16.#2.#2.#3.#1). Without this a poll- or
             # app-discovered run leaves active_zone=None, and every zone entity
@@ -257,9 +272,15 @@ def apply_status_plaintext(device, pt: bytes) -> None:
                 # Re-anchor the wall-clock auto-close to the device's own
                 # remaining, so a poll-discovered run (program/app/button) gets
                 # a live countdown and closes cleanly even between polls.
-                device.state.expected_off_at = (
-                    datetime.now(timezone.utc) + timedelta(seconds=st.seconds_remaining)
-                )
+                # Only shift expected_off_at if it is None or if the new expiry
+                # is earlier, preventing the infinite stuck-open drift caused
+                # by firmware that reports static manual run durations.
+                new_off_at = datetime.now(timezone.utc) + timedelta(seconds=st.seconds_remaining)
+                if (
+                    device.state.expected_off_at is None
+                    or new_off_at < device.state.expected_off_at - timedelta(seconds=15)
+                ):
+                    device.state.expected_off_at = new_off_at
         else:
             device.state.active_zone = None
             device.state.seconds_remaining = None
