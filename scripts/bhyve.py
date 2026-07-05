@@ -230,8 +230,12 @@ def build_request_status_protobuf():
 
 
 def build_flow_subscribe_protobuf(interval_ms=1000):
-    """Flow subscribe: #57 { #1=intervalMs; #2=2 }. The device then streams
-    periodic #59 { #1=active, #2=seq(optional), #3=flowRateGpm } frames.
+    """Flow subscribe: #57 { #1=intervalMs; #2=2 }. The device then streams periodic
+    #59 FlowSensorData frames. On fw0111 these carry only three varints:
+    #1=currentFlowRateFrequency_Hz (~0 when dry), #2=currentCycleRunTimeSec (+1/s),
+    #3=currentCycleVolumeTicks (cumulative per run; #1 ~= d#3/dt). The float fields
+    #4=currentFlowRateGpm / #5=currentCycleVolumeGal do NOT populate on fw0111, so gpm
+    is derived from the #3 tick slope. (Vendor names per knobunc's OrbitPbApi schema.)
 
     Byte-for-byte the app's flow-screen subscribe (Gen2 capture: #1=1000, #2=2).
     Only Gen2 (HT25G2) answered it in the app capture; the XD was never asked —
@@ -397,8 +401,11 @@ RX_F_STATUS_RUNECHO = 2   #   #16.#2: active-run echo { #1=2, #2 { #3 { #1 stati
 RX_F_RUNECHO_PARAMS = 2   #     #16.#2.#2 manualParams
 RX_F_RUNECHO_STATION = 3  #     #16.#2.#2.#3 stationInfo
 RX_F_STATION_ID = 1       #     #16.#2.#2.#3.#1: stationId (0-indexed; zone = id + 1)
-RX_F_STATUS_PROGRESS = 6  #   #16.#6: run progress { #5 total sec, #7 remaining sec }
-RX_F_PROGRESS_REMAINING = 7  # #16.#6.#7: seconds remaining in the active run
+RX_F_STATUS_PROGRESS = 6  #   #16.#6: run progress (present only while watering)
+# HW-verified 2026-07-05 (Gen2 fw0111 + XD fw0107): #16.#6.#5 counts DOWN (remaining),
+# #16.#6.#7 is the constant total. Matches knobunc's currentTimeRemainingSec / totalRunTimeSec.
+RX_F_PROGRESS_REMAINING = 5  # #16.#6.#5: seconds remaining (counts down)
+RX_F_PROGRESS_TOTAL = 7      # #16.#6.#7: total run-time seconds (constant)
 RX_F_STATUS_RAINDELAY = 13  # #16.#13: rain-delay block { #1=min, #3=expiry, #4=on }
 RX_F_RD_MINUTES = 1       #   #16.#13.#1: rain-delay minutes
 RX_F_RD_EXPIRY = 3        #   #16.#13.#3: rain-delay expiry, Unix epoch seconds
@@ -423,7 +430,7 @@ class DeviceStatus(NamedTuple):
     battery_mv: int | None       # #16.#14.#3 or standalone #46.#3
     device_clock: int | None = None        # #7 Unix epoch seconds
     active_station: int | None = None      # #16.#2.#2.#3.#1, 0-indexed (zone = +1)
-    seconds_remaining: int | None = None   # #16.#6.#7, present only while watering
+    seconds_remaining: int | None = None   # #16.#6.#5 (counts down), present only while watering
     flow_total: int | None = None          # #59.#3 cumulative volume counter (Gen2)
     rain_delay_minutes: int | None = None  # #16.#13.#1
     rain_delay_expiry: int | None = None   # #16.#13.#3, Unix epoch seconds
@@ -475,7 +482,7 @@ def extract_status(protobuf):
             sfields, RX_F_STATUS_RUNECHO, RX_F_RUNECHO_PARAMS,
             RX_F_RUNECHO_STATION, RX_F_STATION_ID,
         )
-        seconds_remaining = _pb_subfield(  # #16.#6.#7
+        seconds_remaining = _pb_subfield(  # #16.#6.#5 (remaining; counts down)
             sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_REMAINING
         )
         rd = _pb_field(sfields, RX_F_STATUS_RAINDELAY)                      # #16.#13
@@ -692,7 +699,7 @@ def _format_status(st):
         parts.append("watering" if st.is_watering else "idle")
     if st.active_station is not None:          # #16.#2.#2.#3.#1 (0-indexed)
         parts.append(f"zone {st.active_station + 1}")
-    if st.seconds_remaining is not None:       # #16.#6.#7
+    if st.seconds_remaining is not None:       # #16.#6.#5
         parts.append(f"{st.seconds_remaining}s left")
     if st.run_state is not None:
         parts.append(f"run_state={st.run_state}")

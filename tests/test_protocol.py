@@ -43,7 +43,7 @@ def test_pb_field_varint_and_bytes():
 
 def _status_pb(
     *, run_state=None, battery_mv=None, watering_active=None, remaining=None,
-    active_station=None, device_clock=None,
+    total=None, active_station=None, device_clock=None,
 ) -> bytes:
     """Build a device-status protobuf the way the device would emit it, using
     the same field numbers status.py decodes."""
@@ -65,11 +65,14 @@ def _status_pb(
                 rx.RX_F_STATUS_RUNECHO, tx._pb_field_bytes(rx.RX_F_RUNECHO_PARAMS, params)
             )
         if remaining is not None:
-            # #16.#6 run-progress block carrying #7 = seconds remaining.
-            sub += tx._pb_field_bytes(
-                rx.RX_F_STATUS_PROGRESS,
-                tx._pb_field_varint(rx.RX_F_PROGRESS_REMAINING, remaining),
+            # #16.#6 run-progress: #5 = remaining (counts down), #7 = total (constant).
+            # HW-verified 2026-07-05 on Gen2 fw0111 + XD fw0107. Emit a distinct #7 so a
+            # regression that reads total as remaining is caught.
+            prog = tx._pb_field_varint(rx.RX_F_PROGRESS_REMAINING, remaining)
+            prog += tx._pb_field_varint(
+                rx.RX_F_PROGRESS_TOTAL, total if total is not None else 900
             )
+            sub += tx._pb_field_bytes(rx.RX_F_STATUS_PROGRESS, prog)
         if battery_mv is not None:
             sub += tx._pb_field_bytes(
                 rx.RX_F_STATUS_BATT, tx._pb_field_varint(rx.RX_F_BATT_MV, battery_mv)
@@ -149,23 +152,20 @@ def test_extract_status_running():
 
 
 def test_extract_status_decodes_seconds_remaining():
-    # #16.#6.#7 carries seconds remaining while watering (hardware: 600 at start).
+    # #16.#6.#5 carries seconds remaining while watering (hardware: 600 at start).
     st = rx.extract_status(_status_pb(run_state=4, remaining=600))
     assert st.run_state == 4
     assert st.is_watering is True
     assert st.seconds_remaining == 600
 
 
-def test_extract_status_decodes_seconds_remaining_gen2():
-    # Gen2 carries seconds remaining in #16.#7.#6
-    sub = tx._pb_field_varint(1, 4) + tx._pb_field_bytes(
-        7, tx._pb_field_varint(6, 450)
-    )
-    pb_data = tx._pb_field_bytes(16, sub)
-    st = rx.extract_status(pb_data)
+def test_extract_status_remaining_not_confused_with_total():
+    # HW-verified 2026-07-05 (Gen2 fw0111 + XD fw0107): #16.#6.#5 = remaining (counts
+    # down), #16.#6.#7 = total (constant). The decoder must read #5, never #7.
+    st = rx.extract_status(_status_pb(run_state=4, remaining=300, total=900))
     assert st.run_state == 4
     assert st.is_watering is True
-    assert st.seconds_remaining == 450
+    assert st.seconds_remaining == 300
 
 
 def test_extract_status_decodes_active_station():

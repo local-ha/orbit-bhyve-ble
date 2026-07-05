@@ -31,18 +31,28 @@ RX_F_STATUS_RUNECHO = 2   #   #16.#2: active-run echo { #1=2, #2 { #3 { #1 stati
 RX_F_RUNECHO_PARAMS = 2   #     #16.#2.#2 manualParams
 RX_F_RUNECHO_STATION = 3  #     #16.#2.#2.#3 stationInfo
 RX_F_STATION_ID = 1       #     #16.#2.#2.#3.#1: stationId (0-indexed; zone = id + 1)
-RX_F_STATUS_PROGRESS = 6  #   #16.#6: run progress { #5 total sec, #7 remaining sec }
-RX_F_PROGRESS_REMAINING = 7  # #16.#6.#7: seconds remaining in the active run
+RX_F_STATUS_PROGRESS = 6  #   #16.#6: run progress (present only while watering)
+# HW-verified 2026-07-05 on BOTH a Gen2 (fw0111) and the XD (fw0107): during a live 180s run
+# #16.#6.#5 counted down 174->138->102 (once per second) while #16.#6.#7 stayed a constant 180.
+# So #5 = remaining, #7 = total — matching knobunc's vendor names (currentTimeRemainingSec /
+# totalRunTimeSec). Our earlier decode read #7 as "remaining" and thus reported a static total;
+# that mislabel — not firmware — was the "static remaining" the auto-close drift-guard papered over.
+RX_F_PROGRESS_REMAINING = 5  # #16.#6.#5: seconds remaining in the active run (counts down)
+RX_F_PROGRESS_TOTAL = 7      # #16.#6.#7: total run-time seconds (constant during the run)
 RX_F_STATUS_RAINDELAY = 13  # #16.#13: rain-delay block { #1=min, #3=expiry, #4=on }
 RX_F_RD_MINUTES = 1       #   #16.#13.#1: rain-delay minutes
 RX_F_RD_EXPIRY = 3        #   #16.#13.#3: rain-delay expiry, Unix epoch seconds
-RX_F_RD_ENABLED = 4       #   #16.#13.#4: rain-delay enabled flag (0/1)
+RX_F_RD_ENABLED = 4       #   #16.#13.#4: rain-delay flag (knobunc: delayType enum, not a bool;
+                          #     any nonzero value = a delay is set). Often absent on a bare clear.
 RX_F_STATUS_BATT = 14     #   #16.#14: battery block { #3 = mV }
 RX_F_BATT_MV = 3          #   battery millivolts (#16.#14.#3 or #46.#3)
 RX_F_BATTERY_REPORT = 46  # standalone battery report { #3 = mV }
-RX_F_WATERING = 59        # watering/flow status { #1 flow-active, #2 seq, #3 cumulative }
-RX_F_WATERING_ACTIVE = 1  #   #59.#1: water CURRENTLY flowing (not "valve open")
-RX_F_FLOW_TOTAL = 3       #   #59.#3: CUMULATIVE volume counter for this run (Gen2)
+RX_F_WATERING = 59        # flow sensor data (knobunc: FlowSensorData). Gen2 only; XD emits none.
+RX_F_WATERING_ACTIVE = 1  #   #59.#1: knobunc currentFlowRateFrequency_Hz — ~0 when no water moving,
+                          #     so we use it as a "water currently flowing" signal (not "valve open").
+RX_F_FLOW_TOTAL = 3       #   #59.#3: knobunc currentCycleVolumeTicks — CUMULATIVE per-run counter (gpm
+                          #     = its slope). #59.#4 currentFlowRateGpm (float) exists but is unused
+                          #     here pending HW confirmation that it populates.
 RX_F_WATERING_STATUS = 30  # WateringStatus notification { #1 = status enum } — the "stop ack"
 RX_F_WSTATUS_CODE = 1      #   #30.#1: 1=complete, 2=inProgress, 3=pumpDelay, 4=stationComplete,
                            #   5=stationDelay, 6=programPreDelay, 7=programPostDelay
@@ -153,7 +163,7 @@ class DeviceStatus(NamedTuple):
     battery_mv: int | None       # #16.#14.#3 or standalone #46.#3
     device_clock: int | None = None        # #7 device clock, Unix epoch seconds
     active_station: int | None = None      # #16.#2.#2.#3.#1, 0-indexed (zone = +1)
-    seconds_remaining: int | None = None   # #16.#6.#7, present only while watering
+    seconds_remaining: int | None = None   # #16.#6.#5 (counts down), present only while watering
     flow_total: int | None = None          # #59.#3 cumulative volume counter (Gen2)
     rain_delay_minutes: int | None = None  # #16.#13.#1
     rain_delay_expiry: int | None = None   # #16.#13.#3, Unix epoch seconds
@@ -178,15 +188,11 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
             sfields, RX_F_STATUS_RUNECHO, RX_F_RUNECHO_PARAMS,
             RX_F_RUNECHO_STATION, RX_F_STATION_ID,
         )
-        seconds_remaining = _pb_field(sfields, RX_F_PROGRESS_REMAINING)
-        if not isinstance(seconds_remaining, int):
-            seconds_remaining = _pb_subfield(  # XD: #16.#6.#7
-                sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_REMAINING
-            )
-        if not isinstance(seconds_remaining, int):
-            seconds_remaining = _pb_subfield(  # Gen2: #16.#7.#6
-                sfields, RX_F_PROGRESS_REMAINING, RX_F_STATUS_PROGRESS
-            )
+        # Remaining is #16.#6.#5 on both Gen2 and XD (HW-verified 2026-07-05). #16.#6.#7
+        # is the constant total, so it must NOT be used as a fallback here.
+        seconds_remaining = _pb_subfield(
+            sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_REMAINING
+        )
         if not isinstance(seconds_remaining, int):
             seconds_remaining = None
         rd = _pb_field(sfields, RX_F_STATUS_RAINDELAY)   # #16.#13

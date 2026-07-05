@@ -109,7 +109,7 @@ whose **field number selects the message type**:
 
 | `#N` | Meaning (observed) | Key inner fields |
 |---|---|---|
-| `#16` | **Device status / state** (pushed on connect and on every state change) | `#1` mode (`1`=idle, `3`=rain-delay, `4`=manual running); `#2` active-run echo (`{#1=2, #2{#3{stationId, runSec}}}`); **`#6` run progress `{#5 total sec, #7 remaining sec}`** (present only while watering); `#10` next-event Unix ts; `#13 {#1 min, #3 last-event ts, #4}`; **`#14 {#3 = battery mV}`**; `#16` 8-byte constant token |
+| `#16` | **Device status / state** (pushed on connect and on every state change) | `#1` mode (`1`=idle, `3`=rain-delay, `4`=manual running); `#2` active-run echo (`{#1=2, #2{#3{stationId, runSec}}}`); **`#6` run progress `{#5 remaining sec (counts down), #7 total sec (constant)}`** (present only while watering; HW-verified 2026-07-05); `#10` next-event Unix ts; `#13 {#1 min, #3 last-event ts, #4}`; **`#14 {#3 = battery mV}`**; `#16` 8-byte constant token |
 | `#46` | **Battery report** (standalone) | `#3 = battery mV` (same `{#3: mV}` shape as `#16.#14`) |
 | `#23` | **Device info** | `#2` model string (`HT25G2-0001`); `#3` firmware string (`0111`) |
 | `#19` | **Program / schedule** | `#10`, `#11` Unix ts; `#17` program name (UTF-8, e.g. `"Blueberries And Strawberries"`) |
@@ -218,17 +218,23 @@ Captured by editing one advanced program (name `OurAdvancedProgram`) through eve
   XD this is the *only* place the specific running station is reported. HA decodes it into
   `DeviceState.active_zone` (`status.py`, `e0aa80b`) so only the running zone renders open —
   without it a poll-/app-discovered run left `active_zone=None` and **every** XD zone rendered
-  watering. **`#16.#6`** carries run progress (`#5` total sec, `#7` remaining sec, `#6{…}`),
-  present only while watering.
-  - **Corroborated upstream (2026-06-30):** ljmerza's v2.1.0 XD decode (`6b131f9`,
-    `devices/ht34a.py:_parse_status`) reads exactly `#16.#6.#7` as *seconds remaining* and
-    `#16.#1` as run-state (1=idle/4=watering) — independent confirmation of these semantics on the
-    HT34/HT34A. **Our HA `devices/status.py` now decodes `#16.#6.#7` → `DeviceState.seconds_remaining`
-    and `#16.#2.#2.#3.#1` → `active_zone` (`e0aa80b`)**, arming the wall-clock auto-close and the
-    countdown. **The CLI (`scripts/bhyve.py:extract_status`/`DeviceStatus`) still stops at
-    run-state/battery/rain-delay** — mirroring `#16.#6.#7` (remaining) + `#16.#2` (active station)
-    into the CLI is the remaining parity item (Phase 2 in the capability-buildout plan), a natural
-    rider on the HT25G2 run-state decode PR.
+  watering. **`#16.#6`** carries run progress: **`#5` = seconds remaining (counts DOWN), `#7` =
+  total run-time seconds (constant)**, plus a nested `#6{…}` (also total). Present only while watering.
+  - **HW-verified 2026-07-05 (Gen2 fw0111 + XD fw0107), correcting an earlier mislabel:** during a
+    live 180 s run `#16.#6.#5` counted down `174→138→102` (1/s) while `#16.#6.#7` held constant at
+    `180`. So `#5` = remaining, `#7` = total — matching knobunc's vendor names
+    `currentTimeRemainingSec` / `totalRunTimeSec`. Our earlier decode read **`#16.#6.#7` as
+    "remaining"**, so it reported a static total the whole run — the "static remaining" that the
+    auto-close drift-guard was built to paper over was this mislabel, not firmware. There is **no
+    Gen2↔XD layout flip**: both families use `#16.#6.#5` (`#16.#7` is empty/`{#6=1}`, knobunc's
+    `faultStatus`).
+  - ⚠️ **Upstream likely shares this bug:** ljmerza's v2.1.0 XD decode (`6b131f9`,
+    `devices/ht34a.py:_parse_status`) reportedly reads `#16.#6.#7` as *seconds remaining* — i.e. the
+    total field — so upstream's remaining probably sits static too. Worth an upstream issue/PR once
+    re-confirmed against their code.
+  - **Now fixed here:** HA `devices/status.py` and CLI `scripts/bhyve.py:extract_status` both read
+    `#16.#6.#5` → `seconds_remaining` (counts down), plus `#16.#2.#2.#3.#1` → `active_zone`
+    (`e0aa80b`); the wall-clock auto-close + drift-guard remain as a safety net.
 - **`#19` program** is echoed back on read/save (start times re-emitted as `#8 { #45 = value }`).
 - **`#30`** small command ack around start/stop/clear. **A stop reply is *only* this bare ack**
   (hardware-confirmed 2026-06-30: `f201 02 0801` = `#30 { #1=1 }`) — it carries **no `#16` status
@@ -237,8 +243,12 @@ Captured by editing one advanced program (name `OurAdvancedProgram`) through eve
   "not watering"); treat the `#30 {#1=1}` ack as provisional success and rely on the on-device
   auto-close as the safety net. (A start reply, by contrast, usually *does* carry `#16`.)
 - **`#59` watering/flow status:** `{ #1=flow-active(0/1), #2=seq(optional), #3=cumulative }` —
-  emitted periodically (~1/s) after a `#57` subscribe. **Hardware-characterized 2026-07-02 on a live
-  Gen2 run (BTValve01):**
+  emitted periodically (~1/s) after a `#57` subscribe. **Vendor field names** (per knobunc's
+  `OrbitPbApi_FlowSensorData`): `#1 currentFlowRateFrequency_Hz`, `#2 currentCycleRunTimeSec`,
+  `#3 currentCycleVolumeTicks`, `#4 currentFlowRateGpm` (float), `#5 currentCycleVolumeGal` (float).
+  Our `#1`≈flow-active reading is really the Hz field (~0 when dry); the direct `#4` gpm float is
+  unverified-populated here (we derive gpm from the `#3` slope). **Hardware-characterized 2026-07-02
+  on a live Gen2 run (BTValve01):**
   - **`#59.#3` is a CUMULATIVE per-run volume counter, NOT an instantaneous rate.** It climbs
     monotonically for the life of one valve-open (observed `33 → 489 → … → 2340` across a session),
     faster/slower as supply flow is varied, and resets on the next open. The **rate** is its slope

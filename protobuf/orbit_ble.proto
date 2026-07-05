@@ -104,9 +104,10 @@ message OrbitBleMessage {
   optional WateringProgram program        = 19;  // TX/RX program create/edit/replace/delete/read
   optional ProgramCommit   programCommit  = 20;  // TX small follow-up after a program write
   optional DeviceInfo      deviceInfo     = 23;  // RX model / firmware
+  optional WateringStatus  wateringStatus = 30;  // RX bare watering-status ack (e.g. stop -> {#1=1})
   optional BatteryReport   batteryReport  = 46;  // RX standalone battery
   optional StatusSubscribe statusSubscribe = 57; // TX poll/subscribe -> periodic #59
-  optional WateringStatus  wateringStatus = 59;  // RX watering + flow status
+  optional FlowSensorData  flowSensorData = 59;  // RX periodic flow sensor data (Gen2 only)
 }
 
 message TimerMode {
@@ -122,9 +123,12 @@ message StationInfo {
 message StatusRequest {}  // sent empty; works mid-run
 
 message SetRainDelay {
-  optional uint32 minutes      = 1;  // 0 = clear; 1440 = 24h; 2880 = 48h
-  optional uint32 expiryUnixUtc = 3;  // deviceClock + minutes*60
-  optional uint32 enabled      = 4;  // observed = 1
+  // Field names cross-referenced to knobunc's vendor-named OrbitPbApi_SetRainDelay:
+  //   #1 rainDelayTimeMins, #2 delayStartTimeSecEpochUtc, #3 delayEndTimeSecEpochUtc,
+  //   #4 delayType (a ProgramDelayType enum, not a boolean flag).
+  optional uint32 minutes       = 1;  // rainDelayTimeMins; 0 = clear; 1440 = 24h; 2880 = 48h
+  optional uint32 expiryUnixUtc = 3;  // delayEndTimeSecEpochUtc; honored literally -> anchor to deviceClock #7
+  optional uint32 delayType     = 4;  // enum (observed = 1); NOT an on/off flag. May be absent on a bare clear.
 }
 
 message SetClock { optional string localIso8601 = 1; }  // "YYYY-MM-DDThh:mm:ss±hh:mm"
@@ -132,19 +136,41 @@ message SetClock { optional string localIso8601 = 1; }  // "YYYY-MM-DDThh:mm:ss�
 message DeviceStatus {
   optional uint32       mode       = 1;   // 1=idle, 3=rain-delay, 4=manual running
   optional TimerMode    activeRun  = 2;   // echo of the running manual command
+  optional RunProgress  progress   = 6;   // run progress, present only while watering
   optional SetRainDelay rainDelay  = 13;  // current rain-delay status (same shape as #17)
   optional Battery      battery    = 14;  // { #3 = mV }
+}
+// #16.#6 (knobunc: OrbitPbApi_WateringStatus). HW-verified 2026-07-05 on Gen2 fw0111 + XD fw0107.
+message RunProgress {
+  optional uint32 remainingSec = 5;  // currentTimeRemainingSec; counts DOWN during the run
+  optional uint32 totalSec     = 7;  // totalRunTimeSec; constant during the run
 }
 message Battery { optional uint32 millivolts = 3; }
 message BatteryReport { optional Battery battery = 3; }  // #46 { #3 = mV } (standalone shape)
 
+// #57 subscribe/poll -> device streams #59 (knobunc: OrbitPbApi_EnableFlowSensorData).
 message StatusSubscribe {
-  optional uint32 intervalMs = 1;  // e.g. 1000 -> ~1 Hz #59 stream
-  optional uint32 type       = 2;  // selector (2 observed; flow/watering)
+  optional uint32 intervalMs = 1;  // sendDataIntervalMilliSec; e.g. 1000 -> ~1 Hz #59 stream
+  optional uint32 type       = 2;  // sendDataDurationSec per knobunc (2 observed here)
 }
-message WateringStatus {           // #59, emitted periodically after StatusSubscribe
-  optional uint32 active      = 1;  // 0 = not watering
-  optional uint32 flowRateGpm = 3;  // flow sensor reading (Gen2; 0 when dry)
+
+// #59 flow sensor data (knobunc: OrbitPbApi_FlowSensorData). Gen2 only — the XD emits none.
+// Our earlier reconstruction mislabeled #1 as an "active" bool and #3 as "flowRateGpm";
+// the vendor names below are authoritative. status.py uses #1 as a "water flowing" signal
+// (it reads ~0 when dry) and derives instantaneous gpm from the SLOPE of the #3 tick counter.
+message FlowSensorData {
+  optional uint32 flowRateFrequencyHz  = 1;  // currentFlowRateFrequency_Hz; ~0 when no water moving
+  optional uint32 cycleRunTimeSec      = 2;  // currentCycleRunTimeSec
+  optional uint32 cycleVolumeTicks     = 3;  // currentCycleVolumeTicks; CUMULATIVE per-run, resets each open
+  optional float  flowRateGpm          = 4;  // currentFlowRateGpm (direct rate; not yet HW-confirmed populated)
+  optional float  cycleVolumeGal       = 5;  // currentCycleVolumeGal
+}
+
+// #30 bare watering-status ack (knobunc: OrbitPbApi_WateringStatus). A STOP replies with only
+// { #1 = Status } and no #16 status block, so a stop is confirmed by a follow-up #15{} read.
+message WateringStatus {
+  optional uint32 status = 1;  // Status enum: 1 complete, 2 inProgress, 3 pumpDelay, 4 stationComplete,
+                               // 5 stationDelay, 6 programPreDelay, 7 programPostDelay
 }
 message ProgramCommit { optional uint32 n = 1; }  // TX #20 list version/commit after a write
 
