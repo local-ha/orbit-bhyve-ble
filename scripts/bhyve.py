@@ -406,6 +406,7 @@ RX_F_STATUS_PROGRESS = 6  #   #16.#6: run progress (present only while watering)
 # #16.#6.#7 is the constant total. Matches knobunc's currentTimeRemainingSec / totalRunTimeSec.
 RX_F_PROGRESS_REMAINING = 5  # #16.#6.#5: seconds remaining (counts down)
 RX_F_PROGRESS_TOTAL = 7      # #16.#6.#7: total run-time seconds (constant)
+RX_F_PROGRESS_STATION = 4    # #16.#6.#4: currentStationId (running station; HW-verified)
 RX_F_STATUS_RAINDELAY = 13  # #16.#13: rain-delay block { #1=min, #3=expiry, #4=on }
 RX_F_RD_MINUTES = 1       #   #16.#13.#1: rain-delay minutes
 RX_F_RD_EXPIRY = 3        #   #16.#13.#3: rain-delay expiry, Unix epoch seconds
@@ -429,7 +430,7 @@ class DeviceStatus(NamedTuple):
     is_watering: bool | None     # derived from #16.#1 / #59.#1
     battery_mv: int | None       # #16.#14.#3 or standalone #46.#3
     device_clock: int | None = None        # #7 Unix epoch seconds
-    active_station: int | None = None      # #16.#2.#2.#3.#1, 0-indexed (zone = +1)
+    active_station: int | None = None      # #16.#6.#4 (fallback #16.#2.#2.#3.#1), 0-indexed (zone = +1)
     seconds_remaining: int | None = None   # #16.#6.#5 (counts down), present only while watering
     flow_total: int | None = None          # #59.#3 cumulative volume counter (Gen2)
     rain_delay_minutes: int | None = None  # #16.#13.#1
@@ -478,10 +479,14 @@ def extract_status(protobuf):
         sfields = pb_parse(status)
         run_state = _pb_field(sfields, RX_F_STATUS_MODE)
         battery_mv = _pb_subfield(sfields, RX_F_STATUS_BATT, RX_F_BATT_MV)  # #16.#14.#3
-        active_station = _pb_path(  # #16.#2.#2.#3.#1 — which zone is running
-            sfields, RX_F_STATUS_RUNECHO, RX_F_RUNECHO_PARAMS,
-            RX_F_RUNECHO_STATION, RX_F_STATION_ID,
-        )
+        # Which zone is running: prefer the shallow #16.#6.#4, fall back to the
+        # deep timerMode path #16.#2.#2.#3.#1.
+        active_station = _pb_subfield(sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_STATION)
+        if not isinstance(active_station, int):
+            active_station = _pb_path(
+                sfields, RX_F_STATUS_RUNECHO, RX_F_RUNECHO_PARAMS,
+                RX_F_RUNECHO_STATION, RX_F_STATION_ID,
+            )
         seconds_remaining = _pb_subfield(  # #16.#6.#5 (remaining; counts down)
             sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_REMAINING
         )

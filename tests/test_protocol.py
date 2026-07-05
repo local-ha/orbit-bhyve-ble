@@ -169,10 +169,23 @@ def test_extract_status_remaining_not_confused_with_total():
 
 
 def test_extract_status_decodes_active_station():
-    # #16.#2.#2.#3.#1 tells us which zone is running (0-indexed on the wire).
+    # #16.#2.#2.#3.#1 tells us which zone is running (0-indexed) — the deep timerMode
+    # path, which the decoder uses as a fallback when #16.#6.#4 is absent.
     st = rx.extract_status(_status_pb(run_state=4, active_station=2))
     assert st.is_watering is True
     assert st.active_station == 2
+
+
+def test_extract_status_active_station_from_progress_block():
+    # Preferred source: the shallow #16.#6.#4 (currentStationId), HW-verified to track
+    # the running zone. #16.#6 also carries #5 remaining.
+    prog = tx._pb_field_varint(rx.RX_F_PROGRESS_STATION, 2)
+    prog += tx._pb_field_varint(rx.RX_F_PROGRESS_REMAINING, 90)
+    sub = tx._pb_field_varint(rx.RX_F_STATUS_MODE, 4)
+    sub += tx._pb_field_bytes(rx.RX_F_STATUS_PROGRESS, prog)
+    st = rx.extract_status(tx._pb_field_bytes(rx.RX_F_STATUS, sub))
+    assert st.active_station == 2
+    assert st.seconds_remaining == 90
 
 
 def test_extract_status_watering_status_30_enum():

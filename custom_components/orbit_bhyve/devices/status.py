@@ -39,6 +39,8 @@ RX_F_STATUS_PROGRESS = 6  #   #16.#6: run progress (present only while watering)
 # that mislabel — not firmware — was the "static remaining" the auto-close drift-guard papered over.
 RX_F_PROGRESS_REMAINING = 5  # #16.#6.#5: seconds remaining in the active run (counts down)
 RX_F_PROGRESS_TOTAL = 7      # #16.#6.#7: total run-time seconds (constant during the run)
+RX_F_PROGRESS_STATION = 4    # #16.#6.#4: currentStationId — the running station (HW-verified
+                             #   2026-07-05: zone 3 -> 2). Shallow equivalent of #16.#2.#2.#3.#1.
 RX_F_STATUS_RAINDELAY = 13  # #16.#13: rain-delay block { #1=min, #3=expiry, #4=on }
 RX_F_RD_MINUTES = 1       #   #16.#13.#1: rain-delay minutes
 RX_F_RD_EXPIRY = 3        #   #16.#13.#3: rain-delay expiry, Unix epoch seconds
@@ -162,7 +164,7 @@ class DeviceStatus(NamedTuple):
     is_watering: bool | None     # derived from #16.#1 / #59.#1
     battery_mv: int | None       # #16.#14.#3 or standalone #46.#3
     device_clock: int | None = None        # #7 device clock, Unix epoch seconds
-    active_station: int | None = None      # #16.#2.#2.#3.#1, 0-indexed (zone = +1)
+    active_station: int | None = None      # #16.#6.#4 (fallback #16.#2.#2.#3.#1), 0-indexed (zone = +1)
     seconds_remaining: int | None = None   # #16.#6.#5 (counts down), present only while watering
     flow_total: int | None = None          # #59.#3 cumulative volume counter (Gen2)
     rain_delay_minutes: int | None = None  # #16.#13.#1
@@ -184,10 +186,14 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         sfields = pb_parse(status)
         run_state = _pb_field(sfields, RX_F_STATUS_MODE)
         battery_mv = _pb_subfield(sfields, RX_F_STATUS_BATT, RX_F_BATT_MV)
-        active_station = _pb_path(  # #16.#2.#2.#3.#1 — which zone is running
-            sfields, RX_F_STATUS_RUNECHO, RX_F_RUNECHO_PARAMS,
-            RX_F_RUNECHO_STATION, RX_F_STATION_ID,
-        )
+        # Which zone is running: prefer the shallow #16.#6.#4 (currentStationId,
+        # HW-verified), fall back to the deep timerMode path #16.#2.#2.#3.#1.
+        active_station = _pb_subfield(sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_STATION)
+        if not isinstance(active_station, int):
+            active_station = _pb_path(
+                sfields, RX_F_STATUS_RUNECHO, RX_F_RUNECHO_PARAMS,
+                RX_F_RUNECHO_STATION, RX_F_STATION_ID,
+            )
         # Remaining is #16.#6.#5 on both Gen2 and XD (HW-verified 2026-07-05). #16.#6.#7
         # is the constant total, so it must NOT be used as a fallback here.
         seconds_remaining = _pb_subfield(
