@@ -22,6 +22,14 @@ the `#57{#1=0}` unsubscribe so no persistent flow stream is left behind.
 
     # B — raw #59 flow (incl. the #4 gpm float) on a Gen2 while it waters:
     python scripts/exploration/probe_station_and_flow.py flow --device BTValve03 --zone 1
+
+(C) `raindelay`: skew probe — set rain delay with `#1` minutes but `#3` = deviceClock
+    + a short `--skew` seconds, then poll `#16.#13` + run-state to see which field
+    governs expiry (clears near #3? near #1? never self-clears?). No water; always
+    clears the delay at the end. Does NOT block manual runs, only scheduled ones.
+
+    # C — does the device honor #3 (absolute expiry) or #1 (minutes)?
+    python scripts/exploration/probe_station_and_flow.py raindelay --device BTValve03 --skew 120
 """
 import argparse
 import asyncio
@@ -194,20 +202,96 @@ async def run_flow(dev, zone):
         await client.__aexit__(None, None, None)
 
 
+def _dump_raindelay(inner_list, base):
+    """Print run_state + the #16.#13 rain-delay block from a freshly decoded #16."""
+    for inner in inner_list[base:]:
+        top = B.pb_parse(inner["protobuf"])
+        if top is None:
+            continue
+        clock = B._pb_field(top, B.RX_F_CLOCK)
+        st16 = B._pb_field(top, 16)
+        if isinstance(st16, (bytes, bytearray)) and B.pb_parse(st16) is not None:
+            s = B.pb_parse(st16)
+            run_state = B._pb_field(s, 1)
+            rd = B._pb_field(s, 13)                       # #16.#13 rain-delay block
+            rd_fields = None
+            if isinstance(rd, (bytes, bytearray)) and B.pb_parse(rd) is not None:
+                rd_fields = {f: v for f, w, v in B.pb_parse(rd) if w == 0}
+            return clock, run_state, rd_fields
+    return None, None, None
+
+
+async def run_raindelay(dev, minutes=60, skew_sec=120):
+    """Skew probe: set rain delay with #1=`minutes` but #3=deviceClock+`skew_sec`,
+    then poll to see which field governs expiry (does it clear near #3, near #1, or
+    never self-clear?). No water; always clears the delay at the end."""
+    key = bytes.fromhex(dev["network_key"])
+    client, collector, iv, ctr = await _session(dev["mac"], key)
+    try:
+        # 1) read the device clock
+        collector.event.clear()
+        await _send(client, key, iv, ctr, B.build_request_status_protobuf())
+        await B._await_rx(collector, first_timeout=5.0)
+        clock = collector.merged_status().device_clock
+        if clock is None:
+            raise SystemExit("could not read device clock (#7) — retry")
+        expiry = clock + skew_sec
+        print(f"\ndevice_clock = {clock}")
+        print(f">>> SET rain delay: #17 {{#1={minutes} min, #3={expiry} (=clock+{skew_sec}s), #4=1}}")
+        print(f"    (skew: #1 says {minutes*60}s, #3 says {skew_sec}s — watch which one wins)")
+        base = len(collector.decoded)
+        collector.event.clear()
+        await _send(client, key, iv, ctr, B.build_rain_delay_protobuf(minutes, expiry))
+        await B._await_rx(collector, first_timeout=5.0)
+        _c, rs, rd = _dump_raindelay(collector.decoded, base)
+        print(f"    set-reply: run_state={rs}, #16.#13={rd}")
+        t0 = time.time()
+        for off in (5, 45, 90, 130, 170, 210):
+            wait = off - (time.time() - t0)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            base = len(collector.decoded)
+            collector.event.clear()
+            await _send(client, key, iv, ctr, B.build_request_status_protobuf())
+            await B._await_rx(collector, first_timeout=5.0)
+            clk, rs, rd = _dump_raindelay(collector.decoded, base)
+            past = (clk - expiry) if clk is not None else None
+            active = rs == 3 or (rd is not None and rd.get(1))
+            print(f"  t+{time.time()-t0:5.0f}s  clock={clk}  ({past:+}s vs #3)  "
+                  f"run_state={rs}  #16.#13={rd}  -> {'ACTIVE' if active else 'cleared'}")
+    finally:
+        print("\n>>> CLEAR rain delay (#17{#1=0})")
+        base = len(collector.decoded)
+        await _send(client, key, iv, ctr, B.build_rain_delay_protobuf(0))
+        await B._await_rx(collector, first_timeout=4.0)
+        collector.event.clear()
+        await _send(client, key, iv, ctr, B.build_request_status_protobuf())
+        await B._await_rx(collector, first_timeout=4.0)
+        _c, rs, rd = _dump_raindelay(collector.decoded, base)
+        print(f"    after clear: run_state={rs}, #16.#13={rd}")
+        await client.stop_notify(B.READ_CHAR)
+        await client.__aexit__(None, None, None)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("test", choices=["station", "flow"])
+    ap.add_argument("test", choices=["station", "flow", "raindelay"])
     ap.add_argument("--device", required=True, help="device name from $BHYVE_CONFIG")
     ap.add_argument("--zone", type=int, default=1, help="zone number (1-indexed)")
+    ap.add_argument("--minutes", type=int, default=60, help="raindelay: #1 minutes (default 60)")
+    ap.add_argument("--skew", type=int, default=120,
+                    help="raindelay: #3 = deviceClock + this many seconds (default 120)")
     args = ap.parse_args()
     cfg = B.load_config()
     dev = _find_device(cfg, args.device)
     print(f"Target {dev['name']} {dev['mac']}")
     if args.test == "station":
         asyncio.run(run_station(dev, args.zone))
-    else:
+    elif args.test == "flow":
         asyncio.run(run_flow(dev, args.zone))
+    else:
+        asyncio.run(run_raindelay(dev, args.minutes, args.skew))
 
 
 if __name__ == "__main__":
