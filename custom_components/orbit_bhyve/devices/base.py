@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import abc
+import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -38,6 +39,8 @@ class DeviceState:
     device_clock: int | None = None  # #7 device clock, Unix epoch seconds
     rain_delay_minutes: int | None = None
     rain_delay_ends: datetime | None = None
+    last_successful_poll: datetime | None = None
+    consecutive_timeouts: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -47,6 +50,7 @@ class BHyveBleDeviceBase(abc.ABC):
     # Per-class overrides — defaults are HT25's values.
     frame_magic: int = 0x10
     trailer_const: int = 0x10
+    GATT_SETTLE_MS: int = 300
     # Whether the model exposes an inline flow sensor (#57/#59). Gen2 (HT25G2)
     # only per app captures; the XD has no flow screen. Verify on hardware
     # before trusting (the `flow` CLI probes both) — see docs/ble_protocol.md.
@@ -91,6 +95,7 @@ class BHyveBleDeviceBase(abc.ABC):
                 frame_magic=self.frame_magic,
                 trailer_const=self.trailer_const,
                 idle_disconnect_sec=idle_disconnect_sec,
+                gatt_settle_ms=self.GATT_SETTLE_MS,
             )
             self.connection.set_post_handshake_hook(self._post_handshake)
             self.connection.set_plaintext_observer(self._observe_plaintext)
@@ -108,6 +113,12 @@ class BHyveBleDeviceBase(abc.ABC):
     @property
     def unique_id(self) -> str:
         return f"orbit_bhyve_{self.mac.replace(':', '').lower()}"
+
+    @property
+    def _api_lock(self) -> asyncio.Lock:
+        if not hasattr(self, "_api_lock_var"):
+            self._api_lock_var = asyncio.Lock()
+        return self._api_lock_var
 
     async def async_setup(self) -> None:
         """Hook for device classes that want pre-warming. Default: no-op."""

@@ -46,6 +46,9 @@ async def async_setup_entry(
         entities.append(BHyveBatterySensor(coord))
         entities.append(BHyveBatteryVoltageSensor(coord))
         entities.append(BHyveRssiSensor(coord))
+        entities.append(BHyveLastSuccessfulPollSensor(coord))
+        entities.append(BHyveConsecutiveTimeoutsSensor(coord))
+        entities.append(BHyveWateringEndsSensor(coord))
         # Rain delay is a protobuf-family (HT34A/HT25G2) capability.
         if isinstance(device, BHyveProtobufDevice):
             entities.append(BHyveRainDelayEndsSensor(coord))
@@ -177,3 +180,64 @@ class BHyveRainDelayEndsSensor(_BHyveDeviceSensorBase):
     def native_value(self) -> datetime | None:
         state = self.coordinator.data or self.coordinator.device.state
         return state.rain_delay_ends
+
+
+class BHyveLastSuccessfulPollSensor(_BHyveDeviceSensorBase):
+    """Timestamp of the last successful BLE status poll (#15{})."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:clock-check-outline"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_last_successful_poll"
+        self._attr_name = "Last successful poll"
+
+    @property
+    def native_value(self) -> datetime | None:
+        state = self.coordinator.data or self.coordinator.device.state
+        return state.last_successful_poll
+
+
+class BHyveConsecutiveTimeoutsSensor(_BHyveDeviceSensorBase):
+    """Number of consecutive failed BLE status polls."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:counter"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_consecutive_timeouts"
+        self._attr_name = "Consecutive timeouts"
+
+    @property
+    def native_value(self) -> int:
+        state = self.coordinator.data or self.coordinator.device.state
+        return state.consecutive_timeouts
+
+
+class BHyveWateringEndsSensor(_BHyveDeviceSensorBase):
+    """When the active run is expected to auto-close (state.expected_off_at).
+
+    A single wall-clock timestamp (HA renders it as a live relative countdown),
+    not a per-second integer — so it doesn't churn the recorder. Reads `unknown`
+    when the valve is idle. The coordinator arms expected_off_at on start,
+    re-anchors it via the drift-guard, and clears it on close."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:sprinkler"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_watering_ends"
+        self._attr_name = "Watering ends"
+
+    @property
+    def native_value(self) -> datetime | None:
+        state = self.coordinator.data or self.coordinator.device.state
+        return state.expected_off_at

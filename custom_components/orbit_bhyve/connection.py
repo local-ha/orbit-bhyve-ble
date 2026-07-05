@@ -71,6 +71,7 @@ class BHyveBleConnection:
         frame_magic: int = 0x10,
         trailer_const: int = 0x10,
         idle_disconnect_sec: int = 60,
+        gatt_settle_ms: int = 300,
     ):
         self.hass = hass
         self.mac = mac
@@ -78,6 +79,7 @@ class BHyveBleConnection:
         self._frame_magic = frame_magic & 0xFF
         self._trailer_const = trailer_const & 0xFF
         self._idle_sec = idle_disconnect_sec
+        self._gatt_settle_ms = gatt_settle_ms
 
         self._client: BleakClient | None = None
         self._iv: bytes | None = None
@@ -149,6 +151,8 @@ class BHyveBleConnection:
                     BleakClient, ble_device, self.mac, max_attempts=3
                 )
                 _LOGGER.debug("%s: connected", self.mac)
+                if self._gatt_settle_ms > 0:
+                    await asyncio.sleep(self._gatt_settle_ms / 1000.0)
                 # Bound the handshake: on a marginal link the connect succeeds
                 # but the GATT exchange below can hang indefinitely.
                 await asyncio.wait_for(self._handshake(), timeout=HANDSHAKE_TIMEOUT_SEC)
@@ -221,8 +225,30 @@ class BHyveBleConnection:
                 "%s: notif pt=%s (ct=%s)",
                 self.mac, pt.hex(), frame.hex(),
             )
+            if len(pt) >= 4 and pt[:4] != b"\xaa\x77\x5a\x0f":
+                # Only the FIRST frame of a reply must start with the inner-message
+                # header. A long reply that CTR-streams as consecutive 16-byte blocks
+                # (each its own outer frame) has continuation frames that legitimately
+                # do NOT — none of the capabilities wired today produce those, but
+                # Program reads (#19, Phase 4) will. _notif_buf is cleared before each
+                # write, so len<=1 means this is the reply's first frame: a bad header
+                # there is a real CTR desync → self-heal. A bad header on a later frame
+                # is a continuation (or a mid-stream desync we recover on the next
+                # reply), so don't tear the session down under it. (Full multi-frame
+                # reassembly in the observer is deferred to the Programs phase.)
+                if len(self._notif_buf) <= 1:
+                    _LOGGER.warning(
+                        "%s: CTR desync detected (bad header %s) — scheduling disconnect to self-heal",
+                        self.mac, pt[:4].hex(),
+                    )
+                    self.hass.add_job(self.disconnect)
+                return
         except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("%s: notif decrypt failed: %s raw=%s", self.mac, err, frame.hex())
+            _LOGGER.warning(
+                "%s: CTR desync detected (decrypt failed: %s) — scheduling disconnect to self-heal",
+                self.mac, err,
+            )
+            self.hass.add_job(self.disconnect)
             return
         if self._plaintext_observer is not None:
             try:
@@ -294,17 +320,17 @@ class BHyveBleConnection:
         return pt
 
     async def _write_locked(self, plaintext: bytes) -> None:
-        """Encrypt + WRITE_REQ. Caller MUST already hold self._lock and have
+        """Encrypt + write. Caller MUST already hold self._lock and have
         an established connection. Used by send()/send_raw() and by the
         post-handshake hook (which runs inside _open() inside the lock)."""
         frame = self.encrypt(plaintext)
         assert self._client is not None
-        # WRITE_REQ (response=True) is the default — char 6c72 also advertises
-        # write-without-response, but response=True gives ATT-level delivery over
-        # proxies. The device's real ack is a NOTIFICATION, and some transports
-        # (the ESPHome proxy) never relay the ATT Write Response, which would
-        # block ~30s. Cap the wait; the notification drain in send() is the real
-        # ack. Over a direct link the response arrives in <200ms.
+        # WRITE_CHAR (6c72) uses a Write Request (response=True). Over some
+        # transports (notably the ESPHome Bluetooth proxy), the ATT Write
+        # Response is never relayed back, so a plain response=True write blocks
+        # ~30s. Issue the Write Request but cap the wait; the notification drain
+        # in send() is the real ack. Over a direct link the response arrives in
+        # <200ms so this returns immediately.
         try:
             await asyncio.wait_for(
                 self._client.write_gatt_char(WRITE_CHAR, frame, response=True),

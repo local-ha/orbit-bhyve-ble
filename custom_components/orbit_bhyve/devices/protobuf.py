@@ -16,10 +16,13 @@ re-declared, so there is a single source for both directions.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import struct
 import time
 from datetime import datetime, timedelta, timezone
+
+from bleak.exc import BleakError
 
 from .base import BHyveBleDeviceBase
 from .status import MSG_HEADER, _crc16_ccitt, apply_status_plaintext
@@ -137,19 +140,49 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         solicited RX is reliable where the unsolicited push is not."""
         if self.connection is None:
             return
+        self._status_parsed = False
+        # For flow-capable devices (Gen2), proactively send #57{#1=0} unsubscribe
+        # before querying status. Otherwise, a lingering flow subscription from
+        # an earlier session/test will stream #59 and completely suppress #16.
+        if self.has_flow:
+            try:
+                await self.connection.send(_build_message(_FLOW_UNSUBSCRIBE_PB), drain_ms=500)
+            except Exception:  # noqa: BLE001
+                pass
         await self.connection.send(_build_message(_REQUEST_STATUS_PB), drain_ms=drain_ms)
+        # If we still got no status block, retry once with a longer drain window.
+        if self.has_flow and not self._status_parsed:
+            _LOGGER.debug(
+                "%s: refresh_status got no status block — trying reactive unsubscribe", self.mac
+            )
+            try:
+                await self.connection.send(
+                    _build_message(_FLOW_UNSUBSCRIBE_PB), drain_ms=800
+                )
+                await self.connection.send(
+                    _build_message(_REQUEST_STATUS_PB), drain_ms=drain_ms
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     async def read_flow(self) -> None:
         """Spot-check the flow sensor and set state.flow_gpm (instantaneous rate).
 
         #59.#3 is a cumulative counter that only advances while subscribed, so we
-        re-subscribe (#57) a few times over ~4 s, sample the counter after each,
-        and take its slope: gpm = Δcounts/Δt · 60 / self.flow_counts_per_gallon
-        (the configurable "Flow calibration" option). No flow (or valve closed) →
-        the counter doesn't move → 0 gpm. Flow-capable models only (Gen2). Called
-        on the watering poll (live gauge) and by the Check-flow button / automation
-        (on-demand). ALWAYS unsubscribes (#57{#1=0}) afterwards so it never leaves a
-        persistent #59 stream that would starve the next poll's #16 read."""
+        subscribe (#57) once and collect subsequent streamed notifications in the
+        background over ~4 s, sample the counter after each tick, and take its slope:
+        gpm = Δcounts/Δt · 60 / self.flow_counts_per_gallon (the configurable
+        "Flow calibration" option). No flow (or valve closed) → the counter doesn't
+        move → 0 gpm. Flow-capable models only (Gen2). Called on the watering poll
+        (live gauge) and by the Check-flow button / automation (on-demand). ALWAYS
+        unsubscribes (#57{#1=0}) afterwards so it never leaves a persistent #59 stream
+        that would starve the next poll's #16 read."""
+        if self.connection is None or not self.has_flow:
+            return
+        async with self._api_lock:
+            await self._read_flow_locked()
+
+    async def _read_flow_locked(self) -> None:
         if self.connection is None or not self.has_flow:
             return
         try:
@@ -162,8 +195,13 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             for attempt in range(2):
                 self.state.flow_total = None  # ignore any stale counter from before
                 samples: list[tuple[float, int]] = []
-                for _ in range(_FLOW_SAMPLE_CYCLES):
-                    await self.connection.send(_build_message(_FLOW_SUBSCRIBE_PB), drain_ms=1200)
+                # Subscribe once
+                await self.connection.send(_build_message(_FLOW_SUBSCRIBE_PB), drain_ms=1200)
+                if self.state.flow_total is not None:
+                    samples.append((time.monotonic(), self.state.flow_total))
+                # Wait and collect subsequent streamed notifications in the background
+                for _ in range(_FLOW_SAMPLE_CYCLES - 1):
+                    await asyncio.sleep(1.2)
                     if self.state.flow_total is not None:
                         samples.append((time.monotonic(), self.state.flow_total))
                 if samples or attempt:
@@ -175,14 +213,16 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 await self.connection.disconnect()
         finally:
             # Cancel the stream so the next poll's #15 gets a clean #16 (and so we
-            # don't wedge the valve). Best-effort; harmless if nothing was streaming.
+            # don't wedge the valve). Guaranteed delivery: reconnect if we dropped.
             try:
-                if self.connection is not None and self.connection.is_connected:
+                if self.connection is not None:
+                    if not self.connection.is_connected:
+                        await self.connection.ensure_connected()
                     await self.connection.send(
-                        _build_message(_FLOW_UNSUBSCRIBE_PB), drain_ms=300
+                        _build_message(_FLOW_UNSUBSCRIBE_PB), drain_ms=500
                     )
-            except Exception:  # noqa: BLE001
-                pass
+            except (BleakError, Exception) as err:
+                _LOGGER.debug("%s: resilient flow unsubscribe ignored loss: %s", self.mac, err)
 
     async def refresh_state(self):
         """Coordinator poll: actually read the device over BLE (#15{}) so HA
@@ -192,121 +232,164 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         cadence. Best-effort: a failed poll leaves the last-known state rather
         than raising, so one out-of-range moment doesn't mark the device
         unavailable."""
-        if self.connection is not None:
-            try:
-                await self.refresh_status()
-                # Flow only means anything mid-run; poll it (Gen2 only) once a
-                # run is confirmed so the reading tracks the active watering.
-                if self.has_flow and self.state.is_watering:
-                    await self.read_flow()
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("%s: %s status poll failed: %s", self.mac, self.log_label, err)
-            self.state.is_connected = self.connection.is_connected
-        return self.state
+        async with self._api_lock:
+            if self.connection is not None:
+                try:
+                    await self.refresh_status()
+                    self.state.last_successful_poll = datetime.now(timezone.utc)
+                    self.state.consecutive_timeouts = 0
+                    # "Connected" tracks whether the last poll REACHED the device,
+                    # not the momentary BLE link — under the ephemeral model we
+                    # disconnect immediately below, so the live link is always down
+                    # between polls. Poll-reachability is the meaningful signal and
+                    # stays coherent with consecutive_timeouts.
+                    self.state.is_connected = True
+                    # Flow only means anything mid-run; poll it (Gen2 only) once a
+                    # run is confirmed so the reading tracks the active watering.
+                    if self.has_flow and self.state.is_watering:
+                        await self._read_flow_locked()
+                except Exception as err:  # noqa: BLE001
+                    self.state.consecutive_timeouts += 1
+                    self.state.is_connected = False
+                    _LOGGER.debug(
+                        "%s: %s status poll failed (%d consecutive): %s",
+                        self.mac, self.log_label, self.state.consecutive_timeouts, err
+                    )
+                finally:
+                    await self.connection.disconnect()
+            return self.state
 
     async def start_watering(self, station: int, duration_sec: int) -> bool:
-        if self.connection is None:
-            return False
-        # Stations are 0-indexed on the wire (station 1 -> 0).
-        plaintext = _build_message(_build_start_pb(station - 1, duration_sec))
-        # The start reply usually carries a #16 status that _observe_plaintext
-        # decodes into self.state.is_watering; if this one didn't, poll #15{} to
-        # read the real run-state before deciding. Retry once with a fresh
-        # session if still unconfirmed.
-        for attempt in range(2):
-            notifs = await self.connection.send(plaintext, drain_ms=2000)
-            self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
-            if not self.state.is_watering:
-                await self.refresh_status()
-            if self.state.is_watering:
-                now = datetime.now(timezone.utc)
-                self.state.active_zone = station
-                self.state.started_at = now
-                # Arm the wall-clock auto-close: the coordinator flips the valve
-                # closed at expected_off_at even if a later BLE read/stop fails,
-                # so it can't sit stuck-open on the device's own timer.
-                self.state.expected_off_at = now + timedelta(seconds=duration_sec)
-                if not self.state.seconds_remaining:
-                    self.state.seconds_remaining = duration_sec
-                _LOGGER.debug("%s: %s START confirmed watering", self.mac, self.log_label)
-                return True
-            _LOGGER.warning(
-                "%s: %s START not confirmed (attempt %d/2) — fresh session",
-                self.mac, self.log_label, attempt + 1,
-            )
-            await self.connection.disconnect()
-        _LOGGER.error(
-            "%s: %s START failed to actuate after retries", self.mac, self.log_label
-        )
-        return False
+        async with self._api_lock:
+            if self.connection is None:
+                return False
+            try:
+                # Stations are 0-indexed on the wire (station 1 -> 0).
+                plaintext = _build_message(_build_start_pb(station - 1, duration_sec))
+                # The start reply usually carries a #16 status that _observe_plaintext
+                # decodes into self.state.is_watering; if this one didn't, poll #15{} to
+                # read the real run-state before deciding. Retry once with a fresh
+                # session if still unconfirmed.
+                for attempt in range(2):
+                    notifs = await self.connection.send(plaintext, drain_ms=2000)
+                    self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
+                    if not self.state.is_watering:
+                        # Give the physical valve solenoid time to actuate and settle
+                        # before querying the status echo.
+                        await asyncio.sleep(1.0)
+                        await self.refresh_status()
+                    if self.state.is_watering:
+                        now = datetime.now(timezone.utc)
+                        self.state.active_zone = station
+                        self.state.started_at = now
+                        # Arm the wall-clock auto-close: the coordinator flips the valve
+                        # closed at expected_off_at even if a later BLE read/stop fails,
+                        # so it can't sit stuck-open on the device's own timer.
+                        self.state.expected_off_at = now + timedelta(seconds=duration_sec)
+                        if not self.state.seconds_remaining:
+                            self.state.seconds_remaining = duration_sec
+                        _LOGGER.debug("%s: %s START confirmed watering", self.mac, self.log_label)
+                        return True
+                    _LOGGER.warning(
+                        "%s: %s START not confirmed (attempt %d/2) — fresh session",
+                        self.mac, self.log_label, attempt + 1,
+                    )
+                    if attempt < 1:
+                        await self.connection.disconnect()
+                _LOGGER.error(
+                    "%s: %s START failed to actuate after retries", self.mac, self.log_label
+                )
+                return False
+            finally:
+                await self.connection.disconnect()
 
     async def stop_watering(self, station: int | None = None) -> bool:
-        if self.connection is None:
-            return False
-        plaintext = _build_message(_STOP_PB)
-        for attempt in range(2):
-            notifs = await self.connection.send(plaintext, drain_ms=2000)
-            self._stamp_command("stop", len(notifs))
-            # The device answers a stop with a bare #30 ack (no #16 status), so
-            # the send alone never updates is_watering. Poll #15{} to read the
-            # real run-state (idle, or run-state 3 if a rain delay is active —
-            # both are "not watering") before deciding.
-            await self.refresh_status()
-            if not self.state.is_watering:
-                self.state.active_zone = None
-                self.state.seconds_remaining = None
-                self.state.started_at = None
-                self.state.expected_off_at = None
-                _LOGGER.debug("%s: %s STOP confirmed idle", self.mac, self.log_label)
-                return True
-            _LOGGER.warning(
-                "%s: %s STOP not confirmed (attempt %d/2) — fresh session",
-                self.mac, self.log_label, attempt + 1,
-            )
-            await self.connection.disconnect()
-        _LOGGER.error(
-            "%s: %s STOP failed to close after retries", self.mac, self.log_label
-        )
-        return False
+        async with self._api_lock:
+            if self.connection is None:
+                return False
+            try:
+                plaintext = _build_message(_STOP_PB)
+                for attempt in range(2):
+                    notifs = await self.connection.send(plaintext, drain_ms=2000)
+                    self._stamp_command("stop", len(notifs))
+                    # Give the physical valve solenoid time to actuate and settle
+                    # before querying the status echo.
+                    await asyncio.sleep(1.0)
+                    # The device answers a stop with a bare #30 ack (no #16 status), so
+                    # the send alone never updates is_watering. Poll #15{} to read the
+                    # real run-state (idle, or run-state 3 if a rain delay is active —
+                    # both are "not watering") before deciding.
+                    await self.refresh_status()
+                    if not self.state.is_watering:
+                        self.state.active_zone = None
+                        self.state.seconds_remaining = None
+                        self.state.started_at = None
+                        self.state.expected_off_at = None
+                        _LOGGER.debug("%s: %s STOP confirmed idle", self.mac, self.log_label)
+                        return True
+                    _LOGGER.warning(
+                        "%s: %s STOP not confirmed (attempt %d/2) — fresh session",
+                        self.mac, self.log_label, attempt + 1,
+                    )
+                    if attempt < 1:
+                        await self.connection.disconnect()
+                _LOGGER.error(
+                    "%s: %s STOP failed to close after retries", self.mac, self.log_label
+                )
+                return False
+            finally:
+                await self.connection.disconnect()
 
     async def set_rain_delay(self, minutes: int) -> bool:
         """Set the rain delay to `minutes` (0 clears). Returns True once the
         device's #16.#13 echo confirms the new state."""
-        if self.connection is None:
-            return False
-        if minutes <= 0:
-            return await self.clear_rain_delay()
-        # Absolute expiry the device enforces. A skew probe (2026-06-30) showed
-        # the device honors #3 LITERALLY (it does not recompute it from #1
-        # minutes), so #3 must be anchored to the *device* clock, not the host
-        # clock — otherwise a clock-skewed device ends the delay early/late by
-        # the skew. Read the device clock first via #15{} (stored on
-        # DeviceState.device_clock by apply_status_plaintext), and fall back to
-        # host UTC only if the device didn't report one this session.
-        await self.refresh_status()
-        base = self.state.device_clock or int(time.time())
-        expiry = base + minutes * 60
-        plaintext = _build_message(_build_rain_delay_pb(minutes, expiry))
-        notifs = await self.connection.send(plaintext, drain_ms=2000)
-        self._stamp_command(f"rain_delay set {minutes}m", len(notifs))
-        # Read back the authoritative #16.#13 echo via #15{} rather than trusting
-        # the set reply's push (which the device suppresses while active).
-        await self.refresh_status()
-        ok = bool(self.state.rain_delay_minutes)
-        _LOGGER.log(
-            logging.DEBUG if ok else logging.WARNING,
-            "%s: %s rain-delay set %dm %s",
-            self.mac, self.log_label, minutes, "confirmed" if ok else "unconfirmed",
-        )
-        return ok
+        async with self._api_lock:
+            if self.connection is None:
+                return False
+            try:
+                if minutes <= 0:
+                    return await self._clear_rain_delay_unlocked()
+                # Absolute expiry the device enforces. A skew probe (2026-06-30) showed
+                # the device honors #3 LITERALLY (it does not recompute it from #1
+                # minutes), so #3 must be anchored to the *device* clock, not the host
+                # clock — otherwise a clock-skewed device ends the delay early/late by
+                # the skew. Read the device clock first via #15{} (stored on
+                # DeviceState.device_clock by apply_status_plaintext), and fall back to
+                # host UTC only if the device didn't report one this session.
+                await self.refresh_status()
+                base = self.state.device_clock or int(time.time())
+                expiry = base + minutes * 60
+                plaintext = _build_message(_build_rain_delay_pb(minutes, expiry))
+                notifs = await self.connection.send(plaintext, drain_ms=2000)
+                self._stamp_command(f"rain_delay set {minutes}m", len(notifs))
+                # Read back the authoritative #16.#13 echo via #15{} rather than trusting
+                # the set reply's push (which the device suppresses while active).
+                await self.refresh_status()
+                ok = bool(self.state.rain_delay_minutes)
+                _LOGGER.log(
+                    logging.DEBUG if ok else logging.WARNING,
+                    "%s: %s rain-delay set %dm %s",
+                    self.mac, self.log_label, minutes, "confirmed" if ok else "unconfirmed",
+                )
+                return ok
+            finally:
+                await self.connection.disconnect()
 
     async def clear_rain_delay(self) -> bool:
         """Clear the rain delay (#17{#1=0}). Returns True once #16.#13 reads off."""
-        if self.connection is None:
-            return False
-        plaintext = _build_message(_build_rain_delay_pb(0, None))
-        notifs = await self.connection.send(plaintext, drain_ms=2000)
-        self._stamp_command("rain_delay clear", len(notifs))
-        # Confirm the cleared #16.#13 echo via a #15{} read-back.
-        await self.refresh_status()
-        return not self.state.rain_delay_minutes
+        async with self._api_lock:
+            if self.connection is None:
+                return False
+            return await self._clear_rain_delay_unlocked()
+
+    async def _clear_rain_delay_unlocked(self) -> bool:
+        try:
+            plaintext = _build_message(_build_rain_delay_pb(0, None))
+            notifs = await self.connection.send(plaintext, drain_ms=2000)
+            self._stamp_command("rain_delay clear", len(notifs))
+            # Confirm the cleared #16.#13 echo via a #15{} read-back.
+            await self.refresh_status()
+            return not self.state.rain_delay_minutes
+        finally:
+            if self.connection is not None:
+                await self.connection.disconnect()

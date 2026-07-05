@@ -71,12 +71,9 @@ class BHyveSyncButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEntity):
 
     async def async_press(self) -> None:
         device = self.coordinator.device
-        conn = device.connection
-        if conn is None:
+        if device.connection is None:
             return
         _LOGGER.info("%s: sync requested via button", device.mac)
-        await conn.disconnect()
-        await conn.ensure_connected()
         await self.coordinator.async_request_refresh()
 
 
@@ -105,16 +102,9 @@ class BHyveCheckFlowButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEnti
 
     async def async_press(self) -> None:
         device = self.coordinator.device
-        conn = device.connection
-        if conn is None:
+        if device.connection is None:
             return
         _LOGGER.info("%s: flow check requested via button", device.mac)
-        # Force a fresh session: a pooled connection reused between polls can have
-        # a desynced RX counter (dropped #59 during streaming), which decodes the
-        # flow reply to garbage. A clean handshake resyncs it. (read_flow also
-        # self-heals, but starting fresh avoids a wasted first attempt.)
-        await conn.disconnect()
-        await conn.ensure_connected()
         await device.read_flow()
         # Push the freshly-sampled flow_gpm to entities without a full #15 poll.
         self.coordinator.async_set_updated_data(device.state)
