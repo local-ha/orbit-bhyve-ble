@@ -43,3 +43,4 @@ logs/
 # Build artifacts
 *.zip
 release_build/
+.agents/mcp_config.json

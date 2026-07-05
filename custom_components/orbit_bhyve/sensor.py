@@ -16,6 +16,7 @@ from homeassistant.const import (
     PERCENTAGE,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
     UnitOfElectricPotential,
+    UnitOfVolumeFlowRate,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -48,6 +49,9 @@ async def async_setup_entry(
         # Rain delay is a protobuf-family (HT34A/HT25G2) capability.
         if isinstance(device, BHyveProtobufDevice):
             entities.append(BHyveRainDelayEndsSensor(coord))
+        # Flow-rate gauge only for models with a flow sensor (Gen2, not the XD).
+        if getattr(device, "has_flow", False):
+            entities.append(BHyveFlowRateSensor(coord))
     async_add_entities(entities)
 
 
@@ -121,6 +125,40 @@ class BHyveRssiSensor(_BHyveDeviceSensorBase):
     @property
     def native_value(self) -> int | None:
         return self.coordinator.device.rssi
+
+
+class BHyveFlowRateSensor(_BHyveDeviceSensorBase):
+    """Instantaneous flow rate (gpm) from the last flow spot-check (Gen2).
+
+    Deliberately NOT a cumulative water meter: #59.#3's counter only advances
+    while a #57 subscription is live, so HA never sees the whole run — a
+    cumulative total would badly undercount. Instead `read_flow` samples the
+    counter's slope over a few seconds and stores an instantaneous gpm here.
+    Updated automatically on the watering poll (live during a run) and on demand
+    (Check-flow button / automation).
+
+    `state_class = MEASUREMENT`: each reading is a real ~4 s slope of actual flow,
+    so long-term avg/min/max statistics are honest. For cumulative gallons, add
+    HA's built-in Riemann-sum Integration helper on this entity (see the README)
+    — that integrates the rate into a proper volume total; the raw counter can't
+    be a passive meter here. See docs/ble_protocol.md.
+    """
+
+    _attr_device_class = SensorDeviceClass.VOLUME_FLOW_RATE
+    _attr_native_unit_of_measurement = UnitOfVolumeFlowRate.GALLONS_PER_MINUTE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:water"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_flow_rate"
+        self._attr_name = "Flow rate"
+
+    @property
+    def native_value(self) -> float | None:
+        state = self.coordinator.data or self.coordinator.device.state
+        return state.flow_gpm
 
 
 class BHyveRainDelayEndsSensor(_BHyveDeviceSensorBase):

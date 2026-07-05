@@ -62,6 +62,12 @@ Per discovered sprinkler device:
 - **Sync** button per device — forces a fresh BLE connect + init
   handshake. Useful after a long idle, or to refresh the battery
   reading on demand without waiting for the next poll.
+- **Flow rate** sensor (gal/min) + **Check flow** button — **Gen2 (HT25G2)
+  only**, which is the only model with an inline flow sensor. The rate is
+  sampled from the device's flow counter and updates live during watering; the
+  button (or an automation) triggers an on-demand spot check — handy to confirm
+  water is actually moving, or as a leak check while idle. It's an instantaneous
+  rate, not a meter — see *Cumulative water usage* below for gallons.
 - Manufacturer / model / firmware / MAC are exposed via the device's
   "Device info" panel.
 
@@ -86,6 +92,38 @@ registry.
   station is watering
 - **Polling interval — watering** (sec) — faster polling while a station is
   active
+- **Flow calibration** (sensor counts per gallon) — Gen2 flow-rate scale. The
+  default (433) was measured on real hardware; re-calibrate for your own valve by
+  running a known volume and dividing the flow counter's delta by the gallons
+  collected (the `flow` CLI prints the delta). Only affects the Flow rate sensor.
+  Note: a smaller number reports a *higher* gal/min (rate = counts ÷ this ÷ time),
+  so to *halve* the reading you *double* the number.
+
+Option changes apply **live, without a reload** — they take effect on the next
+poll, so you can tune them mid-run without disturbing an active watering. (The
+options *form* itself only appears after the first restart that installs a new
+version.)
+
+## Cumulative water usage (Integration helper)
+
+The **Flow rate** sensor is an instantaneous rate, not a totalizer — the device's
+flow counter only advances while HA is actively subscribed, and HA polls (rather
+than staying connected) to spare the valve's batteries, so a passive water-meter
+reading would badly undercount. To get **gallons used** with proper long-term
+statistics, integrate the rate with Home Assistant's built-in
+[Riemann sum integral](https://www.home-assistant.io/integrations/integration/)
+helper:
+
+1. **Settings → Devices & Services → Helpers → Create Helper → Integral sensor**.
+2. **Input sensor:** the device's *Flow rate* entity. **Metric prefix:** none;
+   **Time unit:** minutes (the rate is gal/**min**); **Integration method:** left
+   (or trapezoidal). Name it e.g. *BTValve01 Water used*.
+3. The resulting sensor accumulates gallons and carries `total_increasing`
+   statistics, so it can feed the Energy/water dashboard and long-term history.
+
+Accuracy is good for steady irrigation (e.g. drip zones); the only error source
+is flow variation *between* polls — tighten the watering poll interval if you
+want finer resolution (at some battery cost).
 
 ## How it works
 

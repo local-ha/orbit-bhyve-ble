@@ -113,7 +113,7 @@ whose **field number selects the message type**:
 | `#46` | **Battery report** (standalone) | `#3 = battery mV` (same `{#3: mV}` shape as `#16.#14`) |
 | `#23` | **Device info** | `#2` model string (`HT25G2-0001`); `#3` firmware string (`0111`) |
 | `#19` | **Program / schedule** | `#10`, `#11` Unix ts; `#17` program name (UTF-8, e.g. `"Blueberries And Strawberries"`) |
-| `#59` | **Watering status** (periodic) | `#1` active flag (`0` = not watering); `#3` |
+| `#59` | **Watering / flow status** (periodic, after a `#57` subscribe) | `#1` flow-active (`1` = water currently flowing — **not** "valve open"); `#2` seq (optional); `#3` **cumulative** per-run volume counter (raw device units, resets each valve-open) |
 | `#30` / `#31` | **Command ack / flag** (small, around start/stop) | `#1`/`#6` boolean-ish |
 
 Battery is the highest-value field for Home Assistant: it appears both standalone (`#46`)
@@ -173,7 +173,7 @@ behaviorally cross-checked against the operator's action log**, not vendor-confi
 | **Set / clear rain delay** | `#17 { #1=minutes; #3=expiryUnixUTC; #4=1 }` | `minutes=0` clears. `expiry = deviceClock + minutes·60`. Confirmed 1440=24 h, 2880=48 h. **The device honors `#3` literally and stores `#1` independently** (skew probe 2026-06-30: sent `#1=360 min` with a skewed `#3=clock+1h`; the device echoed back `#1=360` *and* `#3=clock+1h` unchanged — it enforces the absolute `#3`, it does **not** recompute it from `#1`). ⇒ **`#3` must be anchored to the *device* clock** (`#7`), not the host clock; with a clock-skewed device a host-anchored expiry ends the delay early/late by the skew. Keep `#1` and `#3` consistent (`#3 = deviceClock + #1·60`). |
 | **Create / edit / replace program** | `#19 { … }` | Write the full program to its slot (`#1`). **Replace** = write the replacement's content to the target slot — no special opcode. Full schema below. |
 | **Delete program** | `#19 { #1=slot; #17=name; #10/#14/#15/#16/#21; *no* #8, *no* #9 }` | A slot write stripped of start times (`#8`) and zone durations (`#9`) clears the slot. Confirmed deleting two programs (slots A and C). |
-| **Subscribe / poll status (flow)** | `#57 { #1=intervalMs; #2=type }` | `#1=1000` → device streams periodic `#59` ~1/s; used by the flow screen. (Gen2.) |
+| **Subscribe / unsubscribe flow** | `#57 { #1=intervalMs; #2=type }` | **Subscribe** = `#57 { #1=1000; #2=2 }` (protobuf `ca030508e8071002`) → device streams periodic `#59` ~1/s. **This is a PERSISTENT stream** that survives reconnects and, crucially, **suppresses the `#16` status response** — while subscribed, `#15` returns only `#59`, never `#16` (hardware, 2026-07-03: a valve left subscribed answered every `#15` with `#59`/`run_state=None`, and unbounded per-poll re-subscription eventually **wedged** it). **Unsubscribe** = `#57 { #1=0; #2=2 }` (interval 0, protobuf `ca030408001002`) — **verified 2026-07-03**: after sending it the `#59` stream stopped and the very next `#15` returned a clean full `#16` (`run_state=1`). So any flow read MUST unsubscribe when done. Implemented as CLI `flow` + HA `read_flow()` (Gen2 only, `has_flow`), which always sends `#57{#1=0}` in a `finally`. **Flow is Gen2-only — hardware-confirmed 2026-07-02:** `#57` to the XD (`44:67:55:D8:55:D2`) yielded **zero `#59`** over 10 s vs. 7 frames from a Gen2. |
 | Program commit/refresh | `#20 { #1=n }` | Small follow-up after a program write (`n` varies 8/9/12/13) — a list version/commit, not the core op. |
 | Connect-time queries | `#15 {}`, `#22 {}`, `#45 {}`, `#120 {}` (empty), `#18` clock, `#75 {#1=unixTs; #2=mask}`, `#19` reads of existing programs, device-info → RX `#23` | Sent during the handshake to sync clock + read current state. |
 
@@ -205,22 +205,68 @@ Captured by editing one advanced program (name `OurAdvancedProgram`) through eve
 
 - **Run-state `#16.#1`:** extend the table to `1`=idle, **`3`=rain-delay active**, `4`=manual running.
 - **`#16.#13` rain-delay status:** `{ #1=minutes, #3=expiryUnix, #4=enabled(0/1) }` — echoes the
-  `#17` set command (idle shape is the shorter `{ #1=0, #4=0 }`).
-- **`#16.#2`** echoes the active manual run (`{#1=2, #2{#3{stationId,runSec}}}`); **`#16.#6`**
-  carries run progress (`#5` total sec, `#7` remaining sec, `#6{…}`).
+  `#17` set command. **Clear shapes vary and `#4` is often absent** (hardware-confirmed
+  2026-06-30): an idle read may return `{ #1=0, #4=0 }`, but a **freshly cleared** delay echoes a
+  **bare `{ #1=0 }` with no `#4` at all**. So a decoder must **not** gate "active" on `#4` being
+  present — derive `active = (minutes > 0)` when `#4` is absent, else a clear leaves a stale
+  "active" value (this was a real HA bug: the `#4 is not None` guard dropped the clear). Separately,
+  a **full `#16` status with run-state ≠ 3 and no `#16.#13` block at all** means the delay expired /
+  cleared out-of-band (the device omits the block once inactive) → treat as cleared. Bare acks
+  (`#30`), `#46`, and `#59` frames carry no run-state and must **not** clear it.
+- **`#16.#2`** echoes the active manual run: `{ #1=2, #2 { #3 { #1=stationId, #2=runSec } } }`. The
+  running **zone is `#16.#2.#2.#3.#1` (`stationId`, 0-indexed → zone = id + 1)**; on the 4-station
+  XD this is the *only* place the specific running station is reported. HA decodes it into
+  `DeviceState.active_zone` (`status.py`, `e0aa80b`) so only the running zone renders open —
+  without it a poll-/app-discovered run left `active_zone=None` and **every** XD zone rendered
+  watering. **`#16.#6`** carries run progress (`#5` total sec, `#7` remaining sec, `#6{…}`),
+  present only while watering.
   - **Corroborated upstream (2026-06-30):** ljmerza's v2.1.0 XD decode (`6b131f9`,
     `devices/ht34a.py:_parse_status`) reads exactly `#16.#6.#7` as *seconds remaining* and
     `#16.#1` as run-state (1=idle/4=watering) — independent confirmation of these semantics on the
-    HT34/HT34A. **Neither our CLI (`scripts/bhyve.py:extract_status`/`DeviceStatus`) nor our HA
-    `devices/status.py` decodes `#16.#6` yet** — both stop at run-state/battery/rain-delay. Pick up
-    `#16.#6.#7` (remaining) + `#16.#5`/`#16.#2` (total / active station) as an additive parity
-    item (Phase 2 in the capability-buildout plan) — it's the "time remaining" a HA valve/sensor
-    could surface, and a natural rider on our HT25G2 run-state decode PR.
+    HT34/HT34A. **Our HA `devices/status.py` now decodes `#16.#6.#7` → `DeviceState.seconds_remaining`
+    and `#16.#2.#2.#3.#1` → `active_zone` (`e0aa80b`)**, arming the wall-clock auto-close and the
+    countdown. **The CLI (`scripts/bhyve.py:extract_status`/`DeviceStatus`) still stops at
+    run-state/battery/rain-delay** — mirroring `#16.#6.#7` (remaining) + `#16.#2` (active station)
+    into the CLI is the remaining parity item (Phase 2 in the capability-buildout plan), a natural
+    rider on the HT25G2 run-state decode PR.
 - **`#19` program** is echoed back on read/save (start times re-emitted as `#8 { #45 = value }`).
-- **`#30`** small command ack around start/stop/clear.
-- **`#59` watering/flow status:** `{ #1=active(0/1), #2=?, #3=flowRateGpm }` — emitted
-  periodically (~1/s) after a `#57` subscribe; `#3` carried `0` against the dry Gen2 (the app
-  showed "0 gpm / fault").
+- **`#30`** small command ack around start/stop/clear. **A stop reply is *only* this bare ack**
+  (hardware-confirmed 2026-06-30: `f201 02 0801` = `#30 { #1=1 }`) — it carries **no `#16` status
+  block**, so a stop cannot be confirmed from its own reply. Confirm a stop by issuing a follow-up
+  `#15{}` and decoding the resulting `#16` run-state (idle=1 *or* rain-delay=3 both read
+  "not watering"); treat the `#30 {#1=1}` ack as provisional success and rely on the on-device
+  auto-close as the safety net. (A start reply, by contrast, usually *does* carry `#16`.)
+- **`#59` watering/flow status:** `{ #1=flow-active(0/1), #2=seq(optional), #3=cumulative }` —
+  emitted periodically (~1/s) after a `#57` subscribe. **Hardware-characterized 2026-07-02 on a live
+  Gen2 run (BTValve01):**
+  - **`#59.#3` is a CUMULATIVE per-run volume counter, NOT an instantaneous rate.** It climbs
+    monotonically for the life of one valve-open (observed `33 → 489 → … → 2340` across a session),
+    faster/slower as supply flow is varied, and resets on the next open. The **rate** is its slope
+    (Δcounts/Δt). Decoded into `DeviceStatus.flow_total` (CLI) / `DeviceState.flow_total` (HA).
+  - **`#59.#1` means "water currently flowing", NOT "valve open".** With the valve open but supply
+    throttled to ~0, `#59.#1` reads `0` while the counter is flat. **Consequence for state decode:**
+    `#59.#1` may only *assert* watering (flow ⇒ watering); it must never negate it (no-flow is
+    ambiguous — the valve can be open and dry). `#16.#1` run-state is the authority for valve-open.
+  - **Calibration (measured 2026-07-03):** `counts / FLOW_COUNTS_PER_GALLON` = gallons, with
+    **`FLOW_COUNTS_PER_GALLON = 433`** — a 44.5 s window on BTValve01 logged **+1443 counts** while a
+    bucket collected **3.33 gal** over the same window (`1443 / 3.33 = 433`); self-consistent, since
+    3.33 gal / 44.5 s = 4.49 gpm matches the counter's slope at 433 counts/gal.
+  - **HA surfacing = instantaneous gpm gauge, never a passive cumulative meter.** Because the counter
+    only advances while a `#57` subscription is live, HA can't see a whole run passively — so instead
+    of a `TOTAL_INCREASING` water meter (which would badly undercount), `read_flow()` samples the
+    counter's slope over ~4 s and stores an instantaneous **`flow_gpm`**. Surfaced as a **"Flow rate"**
+    sensor (gpm, **`state_class=MEASUREMENT`** → honest avg/min/max long-term stats, since each reading
+    is a real slope of actual flow), updated automatically on the watering poll (live during a run)
+    and on demand via a **"Check flow"** button / automation (spot check, or a leak check while idle:
+    nonzero flow with the valve closed = a stuck valve). The counts→gallons scale is the configurable
+    **"Flow calibration"** option (`CONF_FLOW_COUNTS_PER_GALLON`, default 433). For **cumulative
+    gallons**, point users at HA's built-in Riemann-sum Integration helper on the gauge (README) —
+    robust regardless of the counter's subscription-gap behaviour. The CLI `flow` command prints the
+    same slope/gpm for bench checks.
+- **`#7` device clock (wrapper field):** the device's own Unix epoch clock. Decoded by both the CLI
+  (`DeviceStatus.device_clock`) and HA (`DeviceState.device_clock`, 2026-07-02) and used to anchor
+  the rain-delay absolute expiry `#3` to the device rather than the host (the device honors `#3`
+  literally — a host/device skew would otherwise end the delay early/late).
 
 ### Gen2 (HT25G2) parity + flow (2026-06-28 re-capture)
 
@@ -232,8 +278,9 @@ decoder resolves handles by ATT behavior), but the **application protocol is byt
 - **Manual start** `#14{#1=2,#2{#3{#1=0,#2=120}}}`, **rain delay** `#17{#1=720(=12 h),…}`
   (RX `#16.#1=3`), and **program** `#19{#1=2 (slot B), #5{} (odd), #8=185 (03:05), …}` all
   match the XD encodings exactly — confirming one protocol across the HT34A/HT25G2 family.
-- **Flow sensor is Gen2-only.** The Gen2 answered the `#57` poll with live `#59` flow frames;
-  the XD exposed no flow path (matching the hardware — the XD has no flow sensor).
+- **Flow sensor is Gen2-only — hardware-confirmed 2026-07-02.** The Gen2 answered the `#57` poll
+  with live `#59` flow frames; the XD, sent the same `#57` directly over BLE, returned **no `#59`
+  at all** (10 s listen) — confirming it has no flow sensor (not just the app hiding the screen).
 - Pre-existing programs are **read back on connect** (e.g. RX `#19` "Tomatoes And Peppers",
   even-days) — a basis for a future "get programs".
 
@@ -252,6 +299,28 @@ its enable path is likewise cloud-gated.
 - **No MAC enforcement.** The device does not validate the BLE link-layer source MAC of incoming writes. Confirmed by experiment with a spoofed adapter MAC.
 - **ATT Write Command vs Write Request.** The device accepts both for short payloads. For longer payloads (≈ 25+ bytes), the device returns ATT Error 0x80 (Application Error) on Write Request but accepts Write Command. The custom integration uses Write Command for compatibility.
 - **Replay protection.** The session-init handshake establishes a per-session IV/counter. Replaying a captured init message from a previous session does not work — the device tracks something across sessions (likely a counter in flash).
+- **Duplicate RX notifications desync the CTR counter (transport gotcha, fix required).** Over an
+  ESPHome BT proxy — especially while the vendor app is contending for the device's single BLE
+  session — the *same* RX frame can be **re-delivered** as multiple identical notifications (observed
+  2026-07-01: one XD dup after a valid decode; a Gen2 storm of ~60 byte-identical frames in 30 ms).
+  Because RX is a continuous CTR stream, decrypting each delivery advances the per-direction counter
+  once per frame, so every frame **after** the dup fails CRC and no further state is decoded. The
+  fix (`connection.py::_on_notify`, `e0aa80b`) is to **drop a byte-identical re-delivery of the
+  immediately-preceding frame** before buffering/decrypting/advancing. This is safe because the same
+  plaintext at a new counter always yields *different* ciphertext, so identical consecutive
+  ciphertext is definitionally a re-delivery. Reset the dedup marker on each new session (handshake
+  and disconnect). Root cause of the re-delivery storm: the vendor app holding the device's single
+  BLE session while the proxy also connects — close the app for clean captures.
+- **A `#59` flow stream can desync the pooled RX counter (fix: reconnect to resync).** After a `#57`
+  subscribe the device streams `#59` ~1/s and keeps going after the caller's drain window closes. On a
+  long-lived pooled connection a single dropped `#59` (proxy loss) desyncs the per-direction RX
+  counter, after which **every** later frame — the next `#59`, a `#15` reply, anything — fails CRC and
+  decodes to garbage (hardware-observed 2026-07-03: an on-demand flow read on a *reused* session
+  returned only undecodable frames, while the next poll, which reconnects fresh, decoded fine). A
+  **fresh handshake re-seeds IV + counter and resyncs**. Fix: if a solicited read yields *no* decodable
+  frame at all (distinct from a valid "flow 0" reply), drop the connection and retry once on a new
+  session — `read_flow` does this, and the on-demand "Check flow" button connects fresh; the periodic
+  poll already reconnects each cycle, so it's naturally immune.
 
 ## Verifying Your Connection
 

@@ -229,6 +229,18 @@ def build_request_status_protobuf():
     return pb_field_bytes(15, b"")
 
 
+def build_flow_subscribe_protobuf(interval_ms=1000):
+    """Flow subscribe: #57 { #1=intervalMs; #2=2 }. The device then streams
+    periodic #59 { #1=active, #2=seq(optional), #3=flowRateGpm } frames.
+
+    Byte-for-byte the app's flow-screen subscribe (Gen2 capture: #1=1000, #2=2).
+    Only Gen2 (HT25G2) answered it in the app capture; the XD was never asked —
+    the `flow` command sends it to BOTH to confirm the XD truly has no flow path
+    (vs. the app just not offering the screen for that model).
+    """
+    return pb_field_bytes(57, pb_field_varint(1, interval_ms) + pb_field_varint(2, 2))
+
+
 # ─── Session derivation ────────────────────────────────────────────────────
 
 def derive_session(init_tx, rx_resp):
@@ -381,6 +393,12 @@ def pb_format(data, indent=1):
 RX_F_CLOCK = 7             # wrapper: device clock, Unix epoch seconds
 RX_F_STATUS = 16          # device status / state submessage
 RX_F_STATUS_MODE = 1      #   #16.#1: 1=idle, 3=rain-delay, 4=manual running
+RX_F_STATUS_RUNECHO = 2   #   #16.#2: active-run echo { #1=2, #2 { #3 { #1 stationId } } }
+RX_F_RUNECHO_PARAMS = 2   #     #16.#2.#2 manualParams
+RX_F_RUNECHO_STATION = 3  #     #16.#2.#2.#3 stationInfo
+RX_F_STATION_ID = 1       #     #16.#2.#2.#3.#1: stationId (0-indexed; zone = id + 1)
+RX_F_STATUS_PROGRESS = 6  #   #16.#6: run progress { #5 total sec, #7 remaining sec }
+RX_F_PROGRESS_REMAINING = 7  # #16.#6.#7: seconds remaining in the active run
 RX_F_STATUS_RAINDELAY = 13  # #16.#13: rain-delay block { #1=min, #3=expiry, #4=on }
 RX_F_RD_MINUTES = 1       #   #16.#13.#1: rain-delay minutes
 RX_F_RD_EXPIRY = 3        #   #16.#13.#3: rain-delay expiry, Unix epoch seconds
@@ -388,8 +406,14 @@ RX_F_RD_ENABLED = 4       #   #16.#13.#4: rain-delay enabled flag (0/1)
 RX_F_STATUS_BATT = 14     #   #16.#14: battery block { #3 = mV }
 RX_F_BATT_MV = 3          #   battery millivolts (in #16.#14 and #46)
 RX_F_BATTERY_REPORT = 46  # standalone battery report { #3 = mV }
-RX_F_WATERING = 59        # watering status { #1 active flag (0=not watering) }
-RX_F_WATERING_ACTIVE = 1
+RX_F_WATERING = 59        # watering/flow status { #1 flow-active, #2 seq, #3 cumulative }
+RX_F_WATERING_ACTIVE = 1  #   #59.#1: water CURRENTLY flowing (not "valve open")
+RX_F_FLOW_TOTAL = 3       #   #59.#3: CUMULATIVE volume counter for this run (Gen2)
+
+# #59.#3 is a cumulative per-run volume counter in raw device units, not gpm.
+# Divide by this to get gallons. MEASURED 2026-07-03 (BTValve01): a 44.5 s window
+# logged +1443 counts while a bucket caught 3.33 gal → 1443/3.33 ≈ 433 counts/gal.
+FLOW_COUNTS_PER_GALLON = 433
 
 
 class DeviceStatus(NamedTuple):
@@ -398,6 +422,9 @@ class DeviceStatus(NamedTuple):
     is_watering: bool | None     # derived from #16.#1 / #59.#1
     battery_mv: int | None       # #16.#14.#3 or standalone #46.#3
     device_clock: int | None = None        # #7 Unix epoch seconds
+    active_station: int | None = None      # #16.#2.#2.#3.#1, 0-indexed (zone = +1)
+    seconds_remaining: int | None = None   # #16.#6.#7, present only while watering
+    flow_total: int | None = None          # #59.#3 cumulative volume counter (Gen2)
     rain_delay_minutes: int | None = None  # #16.#13.#1
     rain_delay_expiry: int | None = None   # #16.#13.#3, Unix epoch seconds
     rain_delay_active: bool | None = None  # #16.#13.#4
@@ -413,10 +440,19 @@ def _pb_field(fields, num):
 
 def _pb_subfield(fields, outer, inner):
     """Return field `inner` inside the length-delimited field `outer`, or None."""
-    blob = _pb_field(fields, outer)
-    if not isinstance(blob, (bytes, bytearray)):
-        return None
-    return _pb_field(pb_parse(blob), inner)
+    return _pb_path(fields, outer, inner)
+
+
+def _pb_path(fields, *nums):
+    """Walk nested length-delimited submessages by field number, returning the
+    final field's value (or None if any hop is missing / not a submessage)."""
+    cur = fields
+    for n in nums[:-1]:
+        blob = _pb_field(cur, n)
+        if not isinstance(blob, (bytes, bytearray)):
+            return None
+        cur = pb_parse(blob)
+    return _pb_field(cur, nums[-1])
 
 
 def extract_status(protobuf):
@@ -427,6 +463,7 @@ def extract_status(protobuf):
 
     clock = _pb_field(top, RX_F_CLOCK)
     run_state = battery_mv = is_watering = None
+    active_station = seconds_remaining = None
     rd_minutes = rd_expiry = rd_active = None
 
     status = _pb_field(top, RX_F_STATUS)          # #16 submessage
@@ -434,6 +471,13 @@ def extract_status(protobuf):
         sfields = pb_parse(status)
         run_state = _pb_field(sfields, RX_F_STATUS_MODE)
         battery_mv = _pb_subfield(sfields, RX_F_STATUS_BATT, RX_F_BATT_MV)  # #16.#14.#3
+        active_station = _pb_path(  # #16.#2.#2.#3.#1 — which zone is running
+            sfields, RX_F_STATUS_RUNECHO, RX_F_RUNECHO_PARAMS,
+            RX_F_RUNECHO_STATION, RX_F_STATION_ID,
+        )
+        seconds_remaining = _pb_subfield(  # #16.#6.#7
+            sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_REMAINING
+        )
         rd = _pb_field(sfields, RX_F_STATUS_RAINDELAY)                      # #16.#13
         if isinstance(rd, (bytes, bytearray)):
             rdf = pb_parse(rd)
@@ -452,17 +496,23 @@ def extract_status(protobuf):
     if battery_mv is None:                         # standalone #46.#3
         battery_mv = _pb_subfield(top, RX_F_BATTERY_REPORT, RX_F_BATT_MV)
 
-    active = _pb_subfield(top, RX_F_WATERING, RX_F_WATERING_ACTIVE)  # #59.#1
-    if active is not None:
-        is_watering = bool(active)
-    elif run_state is not None:
+    # run_state (#16.#1) is authoritative for "valve open"; #59.#1 is "water
+    # currently flowing" — a valve can be open with no flow (#59.#1=0), so #59.#1
+    # may only assert watering, never negate it (see status.py for the rationale).
+    if run_state is not None:
         is_watering = run_state == 4
+    elif _pb_subfield(top, RX_F_WATERING, RX_F_WATERING_ACTIVE):     # #59.#1 truthy
+        is_watering = True
+    flow_total = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_TOTAL)   # #59.#3 cumulative
 
     return DeviceStatus(
         run_state=run_state,
         is_watering=is_watering,
         battery_mv=battery_mv,
         device_clock=clock,
+        active_station=active_station,
+        seconds_remaining=seconds_remaining,
+        flow_total=flow_total,
         rain_delay_minutes=rd_minutes,
         rain_delay_expiry=rd_expiry,
         rain_delay_active=rd_active,
@@ -613,6 +663,7 @@ class _RxCollector:
     def merged_status(self):
         """Combine telemetry across decoded frames (types carry different fields)."""
         run_state = is_watering = battery_mv = device_clock = None
+        active_station = seconds_remaining = flow_total = None
         rd_minutes = rd_expiry = rd_active = None
         for inner in self.decoded:
             st = extract_status(inner["protobuf"])
@@ -620,11 +671,17 @@ class _RxCollector:
             is_watering = st.is_watering if st.is_watering is not None else is_watering
             battery_mv = st.battery_mv if st.battery_mv is not None else battery_mv
             device_clock = st.device_clock if st.device_clock is not None else device_clock
+            active_station = st.active_station if st.active_station is not None else active_station
+            seconds_remaining = (
+                st.seconds_remaining if st.seconds_remaining is not None else seconds_remaining
+            )
+            flow_total = st.flow_total if st.flow_total is not None else flow_total
             rd_minutes = st.rain_delay_minutes if st.rain_delay_minutes is not None else rd_minutes
             rd_expiry = st.rain_delay_expiry if st.rain_delay_expiry is not None else rd_expiry
             rd_active = st.rain_delay_active if st.rain_delay_active is not None else rd_active
         return DeviceStatus(
             run_state, is_watering, battery_mv, device_clock,
+            active_station, seconds_remaining, flow_total,
             rd_minutes, rd_expiry, rd_active,
         )
 
@@ -633,6 +690,10 @@ def _format_status(st):
     parts = []
     if st.is_watering is not None:
         parts.append("watering" if st.is_watering else "idle")
+    if st.active_station is not None:          # #16.#2.#2.#3.#1 (0-indexed)
+        parts.append(f"zone {st.active_station + 1}")
+    if st.seconds_remaining is not None:       # #16.#6.#7
+        parts.append(f"{st.seconds_remaining}s left")
     if st.run_state is not None:
         parts.append(f"run_state={st.run_state}")
     if st.battery_mv is not None:
@@ -712,28 +773,39 @@ async def ble_command(mac, network_key, command, zones=None, duration=600):
         collector = _RxCollector()
         iv, counter = await _init_session(client, key, collector)
 
+        async def send_pb(protobuf):
+            nonlocal counter
+            msg = build_message(protobuf)
+            ct, counter = aes_encrypt(key, iv, counter, msg)
+            await client.write_gatt_char(
+                WRITE_CHAR, build_ble_frame(ct, compute_trailer(msg)), response=False
+            )
+
         if command == "on":
             for zone in zones:
-                protobuf = build_start_protobuf(zone - 1, duration)
-                message = build_message(protobuf)
-                ct, counter = aes_encrypt(key, iv, counter, message)
-                frame = build_ble_frame(ct, compute_trailer(message))
-                await client.write_gatt_char(WRITE_CHAR, frame, response=False)
+                await send_pb(build_start_protobuf(zone - 1, duration))
                 mins, secs = duration // 60, duration % 60
                 time_str = f"{mins}m{secs}s" if secs else f"{mins}m"
                 print(f"Zone {zone} ON for {time_str} — sent!")
 
         elif command == "off":
-            protobuf = build_stop_protobuf()
-            message = build_message(protobuf)
-            ct, counter = aes_encrypt(key, iv, counter, message)
-            frame = build_ble_frame(ct, compute_trailer(message))
-            await client.write_gatt_char(WRITE_CHAR, frame, response=False)
+            await send_pb(build_stop_protobuf())
             print("All zones STOPPED — sent!")
 
         # Wait (bounded) for the device's confirmation, then decode it — fast
         # devices return immediately, a silent one exits on the timeout.
         await _await_rx(collector, first_timeout=4.0)
+
+        # A stop is answered with only a bare #30 ack (no #16 status), so the
+        # first burst can't confirm the real run-state; solicit a full #16 with
+        # #15{}. For a start the #16 usually rides the reply, so only poll if it
+        # didn't. This mirrors the HA confirm path (protobuf.py).
+        need_poll = command == "off" or collector.merged_status().is_watering is None
+        if need_poll:
+            collector.event.clear()
+            await send_pb(build_request_status_protobuf())
+            await _await_rx(collector, first_timeout=4.0)
+
         if collector.decoded:
             print(f"Confirmed: {_format_status(collector.merged_status())}")
         elif collector.raw:
@@ -759,10 +831,17 @@ async def ble_status(mac, network_key):
     async with BleakClient(device, timeout=15.0) as client:
         await _connect(client)
         collector = _RxCollector()
-        await _init_session(client, key, collector)
-        print("Waiting for status push...")
+        iv, counter = await _init_session(client, key, collector)
 
-        # The device pushes a status (#16) on connect; wait (bounded) for it.
+        # Solicit the status rather than waiting on the unsolicited connect-time
+        # push: the device suppresses that push while "active" (watering or a
+        # rain delay active), so a passive read comes up empty exactly when state
+        # matters most. #15{} elicits a full #16 burst reliably in every state.
+        msg = build_message(build_request_status_protobuf())
+        ct, _ = aes_encrypt(key, iv, counter, msg)
+        await client.write_gatt_char(
+            WRITE_CHAR, build_ble_frame(ct, compute_trailer(msg)), response=False
+        )
         await _await_rx(collector, first_timeout=6.0)
         await client.stop_notify(READ_CHAR)
 
@@ -771,11 +850,10 @@ async def ble_status(mac, network_key):
         elif collector.raw:
             print(f"Received {len(collector.raw)} notification(s) but none decoded.")
         else:
-            # We connected fine (MTU printed above), so this isn't range/sleep —
-            # the device just didn't volunteer a status push. It reliably answers a
-            # command, so on/off confirmations read back state even when this won't.
-            print("Connected, but the device sent no status push "
-                  "(it may not volunteer state while active).")
+            # We connected fine (MTU printed above) and solicited a status, so
+            # this isn't range/sleep — the device simply didn't answer this time.
+            print("Connected and requested status, but no decodable reply "
+                  "(retry; the link can drop a burst transiently).")
 
 
 async def ble_rain_delay(mac, network_key, action, hours=None):
@@ -845,6 +923,74 @@ async def ble_rain_delay(mac, network_key, action, hours=None):
         print("Done.")
 
 
+async def ble_flow(mac, network_key, seconds=8):
+    from bleak import BleakClient, BleakScanner
+
+    key = bytes.fromhex(network_key)
+    print(f"Scanning for {mac}...")
+    device = await BleakScanner.find_device_by_address(mac, timeout=25.0)
+    if device is None:
+        print(f"{mac} not found — check it's powered and in BLE range "
+              "(the scan can miss it transiently; just retry).")
+        return
+    print("Found. Connecting...")
+
+    async with BleakClient(device, timeout=15.0) as client:
+        await _connect(client)
+        collector = _RxCollector()
+        iv, counter = await _init_session(client, key, collector)
+
+        async def send_pb(protobuf):
+            nonlocal counter
+            msg = build_message(protobuf)
+            ct, counter = aes_encrypt(key, iv, counter, msg)
+            await client.write_gatt_char(
+                WRITE_CHAR, build_ble_frame(ct, compute_trailer(msg)), response=False
+            )
+
+        # Subscribe (#57), then collect the streamed #59 frames for `seconds`.
+        # A single subscribe yields only a short burst, so re-send each loop to
+        # keep frames coming across the window. This is the XD-vs-Gen2 probe: the
+        # Gen2 answers with #59; if the XD sends none, it has no flow path (vs.
+        # the app merely not offering a flow screen for that model).
+        print(f"Subscribing to flow (#57) and listening for {seconds}s...")
+        print("(#59.#3 is a CUMULATIVE per-run counter, not a rate — the rate is its slope.)")
+        seen = 0
+        samples = []  # (monotonic_time, cumulative_counter)
+        deadline = asyncio.get_event_loop().time() + seconds
+        while asyncio.get_event_loop().time() < deadline:
+            collector.event.clear()
+            await send_pb(build_flow_subscribe_protobuf(1000))
+            await _await_rx(collector, first_timeout=2.0, drain=0.3)
+            for inner in collector.decoded[seen:]:
+                st = extract_status(inner["protobuf"])
+                if st.flow_total is not None:
+                    now = asyncio.get_event_loop().time()
+                    delta = st.flow_total - samples[-1][1] if samples else 0
+                    samples.append((now, st.flow_total))
+                    print(f"  #59  total={st.flow_total:<6} (+{delta})")
+            seen = len(collector.decoded)
+        await client.stop_notify(READ_CHAR)
+
+        if len(samples) >= 2:
+            dt = samples[-1][0] - samples[0][0]
+            dtotal = samples[-1][1] - samples[0][1]
+            rate = dtotal / dt if dt > 0 else 0
+            gpm = rate * 60 / FLOW_COUNTS_PER_GALLON
+            gal = dtotal / FLOW_COUNTS_PER_GALLON
+            print(f"Flow window: +{dtotal} counts over {dt:.1f}s = {rate:.1f} counts/s")
+            print(f"  ÷{FLOW_COUNTS_PER_GALLON} counts/gal (measured): "
+                  f"~{gpm:.2f} gpm, ~{gal:.3f} gal this window")
+            print("  → to re-calibrate: divide a window's counts by the gallons you "
+                  "measured over it, and update FLOW_COUNTS_PER_GALLON.")
+        elif samples:
+            print(f"Flow: 1 #59 frame (total={samples[0][1]}); need ≥2 frames for a rate.")
+        else:
+            print("No #59 flow frames received — this device has no flow-sensor "
+                  "path (expected for the XD; the flow screen is Gen2-only).")
+        print("Done.")
+
+
 def cmd_control(args):
     config = load_config()
 
@@ -902,6 +1048,27 @@ def cmd_status(args):
     asyncio.run(ble_status(mac, network_key))
 
 
+def cmd_flow(args):
+    config = load_config()
+
+    if not config.get("devices"):
+        print("No devices configured. Run setup first:")
+        print("  python3 bhyve.py setup")
+        sys.exit(1)
+
+    dev_idx = (args.device or 1) - 1
+    if dev_idx < 0 or dev_idx >= len(config["devices"]):
+        print(f"Device {dev_idx+1} not found. You have {len(config['devices'])} device(s).")
+        sys.exit(1)
+
+    dev = config["devices"][dev_idx]
+    mac = args.mac or dev["mac"]
+    network_key = dev["network_key"]
+
+    print(f"B-Hyve Controller — {dev['name']}")
+    asyncio.run(ble_flow(mac, network_key, args.seconds))
+
+
 def cmd_rain_delay(args):
     config = load_config()
 
@@ -947,6 +1114,7 @@ Control:
   %(prog)s on 2 60           Zone 2 on for 1 minute
   %(prog)s off               Stop all watering
   %(prog)s status            Read device telemetry (battery, state)
+  %(prog)s flow              Read the flow sensor (Gen2; probes the XD too)
   %(prog)s rain-delay get    Read the current rain delay
   %(prog)s rain-delay set 24 Delay watering for 24 hours
   %(prog)s rain-delay clear  Clear the rain delay
@@ -980,6 +1148,13 @@ Control:
     status_p.add_argument("--device", "-d", type=int, help="Device number (if multiple)")
     status_p.add_argument("--mac", help="Override MAC address")
 
+    # Flow (Gen2 flow sensor; also probes whether the XD reports flow)
+    flow_p = sub.add_parser("flow", help="Read the flow sensor (#57/#59; Gen2)")
+    flow_p.add_argument("seconds", nargs="?", type=int, default=8,
+                        help="Seconds to listen for #59 flow frames (default: 8)")
+    flow_p.add_argument("--device", "-d", type=int, help="Device number (if multiple)")
+    flow_p.add_argument("--mac", help="Override MAC address")
+
     # Rain delay
     rd_p = sub.add_parser("rain-delay", help="Get/set/clear the rain delay")
     rd_p.add_argument("rd_action", choices=["get", "set", "clear"],
@@ -998,6 +1173,8 @@ Control:
         cmd_control(args)
     elif args.action == "status":
         cmd_status(args)
+    elif args.action == "flow":
+        cmd_flow(args)
     elif args.action == "rain-delay":
         cmd_rain_delay(args)
     else:

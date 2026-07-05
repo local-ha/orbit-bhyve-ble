@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..connection import BHyveBleConnection
+from ..const import DEFAULT_FLOW_COUNTS_PER_GALLON
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,12 +27,15 @@ class DeviceState:
     is_watering: bool = False
     active_zone: int | None = None
     seconds_remaining: int | None = None
+    flow_total: int | None = None  # #59.#3 raw cumulative counter (transient; feeds flow_gpm)
+    flow_gpm: float | None = None  # instantaneous flow rate from read_flow's slope (Gen2)
     started_at: datetime | None = None
     expected_off_at: datetime | None = None
     last_command_at: datetime | None = None
     last_command_label: str | None = None
     is_connected: bool = False
     notifications_last_cmd: int = 0
+    device_clock: int | None = None  # #7 device clock, Unix epoch seconds
     rain_delay_minutes: int | None = None
     rain_delay_ends: datetime | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -43,6 +47,10 @@ class BHyveBleDeviceBase(abc.ABC):
     # Per-class overrides — defaults are HT25's values.
     frame_magic: int = 0x10
     trailer_const: int = 0x10
+    # Whether the model exposes an inline flow sensor (#57/#59). Gen2 (HT25G2)
+    # only per app captures; the XD has no flow screen. Verify on hardware
+    # before trusting (the `flow` CLI probes both) — see docs/ble_protocol.md.
+    has_flow: bool = False
 
     def __init__(
         self,
@@ -50,8 +58,12 @@ class BHyveBleDeviceBase(abc.ABC):
         record: dict[str, Any],
         *,
         idle_disconnect_sec: int = 60,
+        flow_counts_per_gallon: int = DEFAULT_FLOW_COUNTS_PER_GALLON,
     ):
         self.hass = hass
+        # Counts→gallons scale for the flow sensor (Gen2). Configurable per
+        # install via the options flow; read_flow divides the counter slope by it.
+        self.flow_counts_per_gallon = flow_counts_per_gallon
         self.cloud_id: str = record["cloud_id"]
         self.name: str = record["name"]
         self.mac: str = record["mac"]

@@ -86,6 +86,16 @@ def _status_frame(run_state: int) -> bytes:
     return pb._build_message(inner)
 
 
+def _flow_frame(active: int, total: int) -> bytes:
+    """A CRC-valid #59 watering/flow notification { #1=flow-active, #3=cumulative }."""
+    inner = pb._pb_field_bytes(
+        rx.RX_F_WATERING,
+        pb._pb_field_varint(rx.RX_F_WATERING_ACTIVE, active)
+        + pb._pb_field_varint(rx.RX_F_FLOW_TOTAL, total),
+    )
+    return pb._build_message(inner)
+
+
 _STATUS_REQ_FRAME = None  # set lazily to the #15{} frame the device emits
 
 
@@ -120,6 +130,7 @@ def _make_device(**state_kwargs):
     dev = object.__new__(BHyveHT25G2Device)  # bypass HA-heavy __init__
     dev.mac = "AA:BB:CC:DD:EE:FF"
     dev.state = DeviceState(**state_kwargs)
+    dev.flow_counts_per_gallon = 433  # set by base __init__ from options normally
     return dev
 
 
@@ -187,6 +198,164 @@ def test_stop_confirms_when_rain_delay_active():
 
     assert ok is True
     assert dev.state.is_watering is False
+
+
+def _status_clock_and_rain_delay(clock: int, minutes: int) -> bytes:
+    """A #16 status carrying #7 device clock (top-level) + an active #16.#13
+    rain-delay block, as the device would answer a #15{} poll."""
+    rd = pb._pb_field_varint(rx.RX_F_RD_MINUTES, minutes)
+    rd += pb._pb_field_varint(rx.RX_F_RD_ENABLED, 1)
+    sub = pb._pb_field_varint(rx.RX_F_STATUS_MODE, 3)
+    sub += pb._pb_field_bytes(rx.RX_F_STATUS_RAINDELAY, rd)
+    top = pb._pb_field_varint(rx.RX_F_CLOCK, clock)
+    top += pb._pb_field_bytes(rx.RX_F_STATUS, sub)
+    return pb._build_message(top)
+
+
+def test_set_rain_delay_anchors_expiry_to_device_clock():
+    # The device honors the absolute #3 expiry literally, so set_rain_delay must
+    # read the device clock (#7) via a #15{} poll first and compute
+    # #3 = deviceClock + minutes*60 — NOT host time. A host/device skew would
+    # otherwise end the delay early/late.
+    clock = 1_700_000_000
+    minutes = 360
+    dev = _make_device(is_watering=False)
+    dev.connection = _FakeConn(
+        dev, on_status=_status_clock_and_rain_delay(clock, minutes), on_command=None
+    )
+
+    ok = asyncio.run(dev.set_rain_delay(minutes))
+
+    assert ok is True
+    status_req = pb._build_message(pb._REQUEST_STATUS_PB)
+    rd_frames = [f for f in dev.connection.sent if f != status_req]
+    assert len(rd_frames) == 1
+    rd_pb = rx.pb_parse(rx._pb_field(rx.pb_parse(rx.decode_inner(rd_frames[0])), 17))
+    assert rx._pb_field(rd_pb, rx.RX_F_RD_MINUTES) == minutes
+    assert rx._pb_field(rd_pb, rx.RX_F_RD_EXPIRY) == clock + minutes * 60
+
+
+# --- flow (#57/#59, Gen2-only) --------------------------------------------
+
+def test_has_flow_only_on_gen2():
+    # Gen2 (HT25G2) has an inline flow sensor; the XD (HT34A) does not.
+    assert BHyveHT25G2Device.has_flow is True
+    assert BHyveHT34ADevice.has_flow is False
+
+
+def test_flow_subscribe_pb_round_trips_and_matches_capture():
+    frame = pb._build_message(pb._FLOW_SUBSCRIBE_PB)
+    assert rx.decode_inner(frame) == pb._FLOW_SUBSCRIBE_PB
+    sub = rx.pb_parse(rx._pb_field(rx.pb_parse(pb._FLOW_SUBSCRIBE_PB), 57))
+    assert rx._pb_field(sub, 1) == 1000   # intervalMs (app capture)
+    assert rx._pb_field(sub, 2) == 2      # type (app capture)
+
+
+def test_read_flow_noop_on_flowless_device():
+    # The XD must never be poked with #57 — it has no flow path.
+    xd = object.__new__(BHyveHT34ADevice)
+    xd.mac = "AA:BB:CC:DD:EE:FF"
+    xd.state = DeviceState()
+    xd.connection = _FakeConn(xd)
+    asyncio.run(xd.read_flow())
+    assert xd.connection.sent == []
+
+
+def test_gpm_from_samples_computes_rate():
+    # 144 counts over 4.45 s = 32.4 counts/s → ~4.49 gpm at 433 counts/gal
+    # (matches the measured BTValve01 calibration run).
+    gpm = pb._gpm_from_samples([(0.0, 0), (4.45, 144)], 433)
+    assert 4.4 <= gpm <= 4.6
+
+
+def test_gpm_from_samples_scales_with_calibration():
+    # Halving counts-per-gallon doubles the reported gpm (the option is honoured).
+    base = pb._gpm_from_samples([(0.0, 0), (4.0, 200)], 400)
+    half = pb._gpm_from_samples([(0.0, 0), (4.0, 200)], 200)
+    assert round(half, 2) == round(base * 2, 2)
+
+
+def test_gpm_from_samples_zero_when_no_advance():
+    assert pb._gpm_from_samples([(0.0, 100), (4.0, 100)], 433) == 0.0  # counter flat
+    assert pb._gpm_from_samples([(0.0, 100)], 433) == 0.0              # one sample
+    assert pb._gpm_from_samples([], 433) == 0.0                         # no samples
+
+
+class _DesyncThenFreshConn:
+    """First flow subscribe decodes to nothing (simulates a desynced RX counter);
+    after a disconnect (fresh handshake) the #59 decodes cleanly."""
+
+    def __init__(self, device):
+        self.device = device
+        self.sent: list[bytes] = []
+        self.disconnects = 0
+        self._fresh = False
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        self.sent.append(frame)
+        if self._fresh:
+            self.device._observe_plaintext(_flow_frame(active=1, total=500))
+        return [b"\x01"]
+
+    async def disconnect(self):
+        self.disconnects += 1
+        self._fresh = True
+
+    @property
+    def is_connected(self):
+        return True
+
+
+def test_read_flow_resyncs_after_desynced_session():
+    # No decodable #59 on the pooled session → read_flow drops the connection and
+    # retries once on a fresh handshake, which decodes (regression for "Check flow
+    # only updated at the next poll").
+    dev = _make_device(is_watering=True)
+    dev.connection = _DesyncThenFreshConn(dev)
+    asyncio.run(dev.read_flow())
+    assert dev.connection.disconnects == 1
+    assert dev.state.flow_gpm == 0.0  # a decodable #59 (flow 0 here) was committed
+    n_sub = dev.connection.sent.count(pb._build_message(pb._FLOW_SUBSCRIBE_PB))
+    assert n_sub == 2 * pb._FLOW_SAMPLE_CYCLES  # both attempts subscribed
+
+
+def test_read_flow_no_reconnect_when_healthy():
+    # A healthy session decodes #59 on the first pass → no wasteful reconnect.
+    dev = _make_device(is_watering=True)
+    dev.connection = _FakeConn(dev, on_status=None, on_command=_flow_frame(active=1, total=500))
+    asyncio.run(dev.read_flow())
+    assert dev.connection.disconnects == 0
+    assert dev.state.flow_gpm == 0.0
+
+
+def test_read_flow_always_unsubscribes():
+    # read_flow must cancel the stream (#57{#1=0}) as its last act, so it never
+    # leaves a persistent #59 subscription that starves the next poll's #16 read.
+    dev = _make_device(is_watering=True)
+    dev.connection = _FakeConn(dev, on_status=None, on_command=_flow_frame(active=1, total=500))
+    asyncio.run(dev.read_flow())
+    assert dev.connection.sent[-1] == pb._build_message(pb._FLOW_UNSUBSCRIBE_PB)
+
+
+def test_refresh_state_subscribes_flow_while_watering():
+    # A Gen2 poll that finds a run in progress should also spot-check flow so the
+    # gauge tracks live: the #57 subscribe is issued and flow_gpm is computed.
+    dev = _make_device(is_watering=False)
+    dev.connection = _FakeConn(
+        dev, on_status=_status_frame(4), on_command=_flow_frame(active=1, total=489)
+    )
+    state = asyncio.run(dev.refresh_state())
+    assert state.is_watering is True
+    assert pb._build_message(pb._FLOW_SUBSCRIBE_PB) in dev.connection.sent
+    assert state.flow_gpm is not None  # a numeric gauge value was set
+
+
+def test_refresh_state_skips_flow_when_idle():
+    # No run -> no flow subscribe (don't wake the radio for nothing).
+    dev = _make_device(is_watering=False)
+    dev.connection = _FakeConn(dev, on_status=_status_frame(1), on_command=None)
+    asyncio.run(dev.refresh_state())
+    assert pb._build_message(pb._FLOW_SUBSCRIBE_PB) not in dev.connection.sent
 
 
 # --- event-driven drain (connection.py) -----------------------------------

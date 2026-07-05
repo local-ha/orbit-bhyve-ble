@@ -43,11 +43,13 @@ def test_pb_field_varint_and_bytes():
 
 def _status_pb(
     *, run_state=None, battery_mv=None, watering_active=None, remaining=None,
-    active_station=None,
+    active_station=None, device_clock=None,
 ) -> bytes:
     """Build a device-status protobuf the way the device would emit it, using
     the same field numbers status.py decodes."""
     out = b""
+    if device_clock is not None:               # #7 top-level wrapper field
+        out += tx._pb_field_varint(rx.RX_F_CLOCK, device_clock)
     if (
         run_state is not None or battery_mv is not None
         or remaining is not None or active_station is not None
@@ -161,10 +163,36 @@ def test_extract_status_decodes_active_station():
     assert st.active_station == 2
 
 
-def test_watering_field_59_takes_precedence_over_absent_runstate():
-    st = rx.extract_status(_status_pb(watering_active=1))
-    assert st.is_watering is True
-    assert st.run_state is None
+def test_extract_status_decodes_device_clock():
+    # #7 (top-level wrapper) is the device's own Unix clock, used to anchor the
+    # rain-delay absolute expiry to the device rather than the host.
+    st = rx.extract_status(_status_pb(run_state=1, device_clock=1_700_000_000))
+    assert st.device_clock == 1_700_000_000
+
+
+def test_watering_field_59_does_not_drive_is_watering():
+    # #59.#1 (flow-active) must NOT set is_watering — only #16.#1 is authoritative.
+    # A #59-asserted "watering" latched HA on when #16 reads were starved by the
+    # flow subscription (hardware 2026-07-03). So a lone #59 (either #1) leaves
+    # is_watering ambiguous (None); the valve state comes from the #16 poll.
+    assert rx.extract_status(_status_pb(watering_active=1)).is_watering is None
+    assert rx.extract_status(_flow_pb(active=1, total=100)).is_watering is None
+    assert rx.extract_status(_flow_pb(active=0, total=724)).is_watering is None
+
+
+def _flow_pb(active, total) -> bytes:
+    """A #59 watering/flow frame: { #1=flow-active, #3=cumulative } (Gen2)."""
+    return tx._pb_field_bytes(
+        rx.RX_F_WATERING,
+        tx._pb_field_varint(rx.RX_F_WATERING_ACTIVE, active)
+        + tx._pb_field_varint(rx.RX_F_FLOW_TOTAL, total),
+    )
+
+
+def test_extract_status_decodes_flow_total():
+    # #59.#3 is the CUMULATIVE per-run volume counter (flow gauge input).
+    st = rx.extract_status(_flow_pb(active=1, total=489))
+    assert st.flow_total == 489
 
 
 def test_standalone_battery_report_field_46():
@@ -283,6 +311,43 @@ def test_apply_sets_active_zone_from_status():
     rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=4, active_station=2)))
     assert dev.state.is_watering is True
     assert dev.state.active_zone == 3  # stationId 2 -> zone 3
+
+
+def test_apply_sets_flow_total_while_watering():
+    dev = _fake_device()
+    rx.apply_status_plaintext(dev, tx._build_message(_flow_pb(active=1, total=489)))
+    assert dev.state.is_watering is True
+    assert dev.state.flow_total == 489
+
+
+def test_apply_clears_flow_on_idle():
+    dev = _fake_device()
+    dev.state.flow_total = 489
+    dev.state.flow_gpm = 4.5
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=1)))
+    assert dev.state.is_watering is False
+    assert dev.state.flow_total is None
+    assert dev.state.flow_gpm == 0.0  # valve closed → gauge reads 0
+
+
+def test_apply_ignores_zero_flow_frame_midrun():
+    # A #59{#1=0} during a run (valve open, supply momentarily off) must NOT
+    # flip is_watering False or clear the run's live fields.
+    dev = _fake_device()  # starts is_watering=True, active_zone=1, seconds=300
+    rx.apply_status_plaintext(dev, tx._build_message(_flow_pb(active=0, total=724)))
+    assert dev.state.is_watering is True
+    assert dev.state.active_zone == 1
+
+
+def test_apply_stores_device_clock():
+    # A #15 poll carrying #7 must land on DeviceState so set_rain_delay can
+    # anchor #3 to the device clock.
+    dev = _fake_device()
+    dev.state.device_clock = None
+    rx.apply_status_plaintext(
+        dev, tx._build_message(_status_pb(run_state=1, device_clock=1_700_000_000))
+    )
+    assert dev.state.device_clock == 1_700_000_000
 
 
 def test_apply_arms_expected_off_from_seconds_remaining():

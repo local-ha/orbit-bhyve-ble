@@ -42,6 +42,11 @@ async def async_setup_entry(
         if coord.device.connection is None:
             continue
         entities.append(BHyveSyncButton(coord))
+        # On-demand flow spot-check for models with a flow sensor (Gen2, not XD):
+        # sample flow NOW (automation hook, or a leak check while idle) rather
+        # than waiting for the watering poll's passive update.
+        if getattr(coord.device, "has_flow", False):
+            entities.append(BHyveCheckFlowButton(coord))
     async_add_entities(entities)
 
 
@@ -73,3 +78,43 @@ class BHyveSyncButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEntity):
         await conn.disconnect()
         await conn.ensure_connected()
         await self.coordinator.async_request_refresh()
+
+
+class BHyveCheckFlowButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEntity):
+    """On-demand flow spot-check (Gen2). Samples the flow sensor now and updates
+    the Flow rate gauge — for automations ('is water actually moving?') and for a
+    leak check while idle (nonzero flow with the valve closed = a stuck valve)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Check flow"
+    _attr_icon = "mdi:water-check"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_check_flow"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.cloud_id)},
+            "name": device.name,
+            "manufacturer": "Orbit Irrigation",
+            "model": device.hardware,
+            "sw_version": device.firmware,
+            "connections": {("mac", device.mac)} if device.mac else set(),
+        }
+
+    async def async_press(self) -> None:
+        device = self.coordinator.device
+        conn = device.connection
+        if conn is None:
+            return
+        _LOGGER.info("%s: flow check requested via button", device.mac)
+        # Force a fresh session: a pooled connection reused between polls can have
+        # a desynced RX counter (dropped #59 during streaming), which decodes the
+        # flow reply to garbage. A clean handshake resyncs it. (read_flow also
+        # self-heals, but starting fresh avoids a wasted first attempt.)
+        await conn.disconnect()
+        await conn.ensure_connected()
+        await device.read_flow()
+        # Push the freshly-sampled flow_gpm to entities without a full #15 poll.
+        self.coordinator.async_set_updated_data(device.state)

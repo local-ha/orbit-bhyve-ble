@@ -67,6 +67,39 @@ _STOP_PB = bytes.fromhex("720408021200")
 # (no #16), so without this poll a healthy stop can never be confirmed.
 _REQUEST_STATUS_PB = bytes.fromhex("7a00")
 
+# #57 { #1=1000 (intervalMs); #2=2 } — flow-sensor subscribe. The device then
+# streams periodic #59 { #1=flow-active, #3=cumulative } frames that
+# apply_status_plaintext folds into state.flow_total. Byte-identical to the app's
+# flow-screen subscribe (Gen2 capture). Gen2-only in the captures; gated by
+# has_flow so we don't poke a flow-less XD.
+_FLOW_SUBSCRIBE_PB = bytes.fromhex("ca030508e8071002")
+
+# #57 { #1=0 (intervalMs=0); #2=2 } — flow UNSUBSCRIBE. A subscribe leaves the
+# device streaming #59 continuously (it persists across reconnects), which starves
+# the #16 status read on later polls and, left unbounded, wedged a valve
+# (hardware, 2026-07-03). Interval 0 cancels the stream. read_flow always sends
+# this after sampling so we never leave a persistent subscription behind.
+_FLOW_UNSUBSCRIBE_PB = bytes.fromhex("ca030408001002")
+
+# read_flow re-subscribes this many times (~1 s each) to sample the cumulative
+# #59.#3 counter over a few seconds and derive an instantaneous rate from its
+# slope. 4 → ~4 s window: enough counts for a clean slope without holding the
+# radio long. The counter only advances while subscribed, so this is inherently
+# a spot check, not a continuous meter.
+_FLOW_SAMPLE_CYCLES = 4
+
+
+def _gpm_from_samples(samples: list[tuple[float, int]], counts_per_gallon: int) -> float:
+    """Instantaneous gpm from (monotonic_time, cumulative_counts) samples:
+    slope in counts/s × 60 / counts-per-gallon. Returns 0.0 if the counter
+    didn't advance (no flow) or there aren't two usable samples."""
+    if len(samples) >= 2 and counts_per_gallon > 0:
+        dt = samples[-1][0] - samples[0][0]
+        dcounts = samples[-1][1] - samples[0][1]
+        if dt > 0 and dcounts > 0:
+            return round(dcounts / dt * 60 / counts_per_gallon, 2)
+    return 0.0
+
 
 def _build_rain_delay_pb(minutes: int, expiry: int | None) -> bytes:
     """Rain delay: #17 { #1=minutes; #3=expiryUnixUTC; #4=1 }.
@@ -106,6 +139,51 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             return
         await self.connection.send(_build_message(_REQUEST_STATUS_PB), drain_ms=drain_ms)
 
+    async def read_flow(self) -> None:
+        """Spot-check the flow sensor and set state.flow_gpm (instantaneous rate).
+
+        #59.#3 is a cumulative counter that only advances while subscribed, so we
+        re-subscribe (#57) a few times over ~4 s, sample the counter after each,
+        and take its slope: gpm = Δcounts/Δt · 60 / self.flow_counts_per_gallon
+        (the configurable "Flow calibration" option). No flow (or valve closed) →
+        the counter doesn't move → 0 gpm. Flow-capable models only (Gen2). Called
+        on the watering poll (live gauge) and by the Check-flow button / automation
+        (on-demand). ALWAYS unsubscribes (#57{#1=0}) afterwards so it never leaves a
+        persistent #59 stream that would starve the next poll's #16 read."""
+        if self.connection is None or not self.has_flow:
+            return
+        try:
+            # Two attempts: a POOLED session whose RX counter has desynced (a dropped
+            # #59 during earlier streaming) decodes every #59 to garbage → no samples.
+            # That's distinct from a genuinely idle valve, which still returns a
+            # decodable #59 (flow 0). So "no decodable #59 at all" means resync: drop
+            # the connection and retry once. A healthy session succeeds on the first
+            # pass with no extra latency (the poll's normal case).
+            for attempt in range(2):
+                self.state.flow_total = None  # ignore any stale counter from before
+                samples: list[tuple[float, int]] = []
+                for _ in range(_FLOW_SAMPLE_CYCLES):
+                    await self.connection.send(_build_message(_FLOW_SUBSCRIBE_PB), drain_ms=1200)
+                    if self.state.flow_total is not None:
+                        samples.append((time.monotonic(), self.state.flow_total))
+                if samples or attempt:
+                    self.state.flow_gpm = _gpm_from_samples(samples, self.flow_counts_per_gallon)
+                    return
+                _LOGGER.debug(
+                    "%s: flow read got no decodable #59 — reconnecting to resync", self.mac
+                )
+                await self.connection.disconnect()
+        finally:
+            # Cancel the stream so the next poll's #15 gets a clean #16 (and so we
+            # don't wedge the valve). Best-effort; harmless if nothing was streaming.
+            try:
+                if self.connection is not None and self.connection.is_connected:
+                    await self.connection.send(
+                        _build_message(_FLOW_UNSUBSCRIBE_PB), drain_ms=300
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
     async def refresh_state(self):
         """Coordinator poll: actually read the device over BLE (#15{}) so HA
         tracks state the device changed on its own — a scheduled PROGRAM run,
@@ -117,6 +195,10 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         if self.connection is not None:
             try:
                 await self.refresh_status()
+                # Flow only means anything mid-run; poll it (Gen2 only) once a
+                # run is confirmed so the reading tracks the active watering.
+                if self.has_flow and self.state.is_watering:
+                    await self.read_flow()
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("%s: %s status poll failed: %s", self.mac, self.log_label, err)
             self.state.is_connected = self.connection.is_connected
@@ -196,13 +278,14 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             return await self.clear_rain_delay()
         # Absolute expiry the device enforces. A skew probe (2026-06-30) showed
         # the device honors #3 LITERALLY (it does not recompute it from #1
-        # minutes), so #3 should be anchored to the *device* clock, not the host
-        # clock. The device clock is app-synced (Δ≈0), so host UTC works in
-        # practice today; anchoring to the device clock (via the Phase 2 #15{}
-        # refresh that will store DeviceState.device_clock) is the clean fix and
-        # is tracked there. The echoed #16.#13.#3 (-> rain_delay_ends) always
-        # displays the device's own value regardless.
-        expiry = int(time.time()) + minutes * 60
+        # minutes), so #3 must be anchored to the *device* clock, not the host
+        # clock — otherwise a clock-skewed device ends the delay early/late by
+        # the skew. Read the device clock first via #15{} (stored on
+        # DeviceState.device_clock by apply_status_plaintext), and fall back to
+        # host UTC only if the device didn't report one this session.
+        await self.refresh_status()
+        base = self.state.device_clock or int(time.time())
+        expiry = base + minutes * 60
         plaintext = _build_message(_build_rain_delay_pb(minutes, expiry))
         notifs = await self.connection.send(plaintext, drain_ms=2000)
         self._stamp_command(f"rain_delay set {minutes}m", len(notifs))

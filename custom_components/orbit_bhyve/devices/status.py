@@ -24,6 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 MSG_HEADER = bytes([0xAA, 0x77, 0x5A, 0x0F])
 
 # RX message field numbers (see docs/ble_protocol.md).
+RX_F_CLOCK = 7            # wrapper: device clock, Unix epoch seconds
 RX_F_STATUS = 16          # device status submessage
 RX_F_STATUS_MODE = 1      #   #16.#1: 1=idle, 3=rain-delay, 4=manual running
 RX_F_STATUS_RUNECHO = 2   #   #16.#2: active-run echo { #1=2, #2 { #3 { #1 stationId } } }
@@ -39,8 +40,9 @@ RX_F_RD_ENABLED = 4       #   #16.#13.#4: rain-delay enabled flag (0/1)
 RX_F_STATUS_BATT = 14     #   #16.#14: battery block { #3 = mV }
 RX_F_BATT_MV = 3          #   battery millivolts (#16.#14.#3 or #46.#3)
 RX_F_BATTERY_REPORT = 46  # standalone battery report { #3 = mV }
-RX_F_WATERING = 59        # watering status { #1 active flag (0=not watering) }
-RX_F_WATERING_ACTIVE = 1
+RX_F_WATERING = 59        # watering/flow status { #1 flow-active, #2 seq, #3 cumulative }
+RX_F_WATERING_ACTIVE = 1  #   #59.#1: water CURRENTLY flowing (not "valve open")
+RX_F_FLOW_TOTAL = 3       #   #59.#3: CUMULATIVE volume counter for this run (Gen2)
 
 
 def _crc16_ccitt(data: bytes, init: int = 0) -> int:
@@ -143,8 +145,10 @@ class DeviceStatus(NamedTuple):
     run_state: int | None        # #16.#1: 1=idle, 3=rain-delay, 4=running
     is_watering: bool | None     # derived from #16.#1 / #59.#1
     battery_mv: int | None       # #16.#14.#3 or standalone #46.#3
+    device_clock: int | None = None        # #7 device clock, Unix epoch seconds
     active_station: int | None = None      # #16.#2.#2.#3.#1, 0-indexed (zone = +1)
     seconds_remaining: int | None = None   # #16.#6.#7, present only while watering
+    flow_total: int | None = None          # #59.#3 cumulative volume counter (Gen2)
     rain_delay_minutes: int | None = None  # #16.#13.#1
     rain_delay_expiry: int | None = None   # #16.#13.#3, Unix epoch seconds
     rain_delay_active: bool | None = None  # #16.#13.#4
@@ -158,6 +162,7 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
     run_state = battery_mv = is_watering = seconds_remaining = None
     active_station = rd_minutes = rd_expiry = rd_active = None
 
+    device_clock = _pb_field(top, RX_F_CLOCK)     # #7 wrapper field
     status = _pb_field(top, RX_F_STATUS)          # #16 submessage
     if isinstance(status, (bytes, bytearray)):
         sfields = pb_parse(status)
@@ -189,18 +194,24 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
     if battery_mv is None:                         # standalone #46.#3
         battery_mv = _pb_subfield(top, RX_F_BATTERY_REPORT, RX_F_BATT_MV)
 
-    active = _pb_subfield(top, RX_F_WATERING, RX_F_WATERING_ACTIVE)  # #59.#1
-    if active is not None:
-        is_watering = bool(active)
-    elif run_state is not None:
+    # ONLY #16.#1 run_state drives is_watering — it is authoritative for whether
+    # the valve is open. #59.#1 ("water currently flowing") deliberately does NOT
+    # touch is_watering: letting a #59 assert "watering" latched HA on when the
+    # #16 read was being starved by an active flow subscription, so the valve
+    # stayed "open" long after the run ended (hardware, 2026-07-03). #59 now
+    # contributes only the flow counter below.
+    if run_state is not None:
         is_watering = run_state == 4
+    flow_total = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_TOTAL)   # #59.#3 cumulative
 
     return DeviceStatus(
         run_state=run_state,
         is_watering=is_watering,
         battery_mv=battery_mv,
+        device_clock=device_clock,
         active_station=active_station,
         seconds_remaining=seconds_remaining,
+        flow_total=flow_total,
         rain_delay_minutes=rd_minutes,
         rain_delay_expiry=rd_expiry,
         rain_delay_active=rd_active,
@@ -216,9 +227,21 @@ def apply_status_plaintext(device, pt: bytes) -> None:
         return
     st = extract_status(protobuf)
 
+    if st.device_clock is not None:
+        # Device's own Unix clock — used to anchor the rain-delay absolute expiry
+        # (#3) to the device rather than the host, since the device honors #3
+        # literally (a host/device skew would otherwise end the delay early/late).
+        device.state.device_clock = st.device_clock
+
     if st.battery_mv is not None and 1500 <= st.battery_mv <= 4000:
         device.battery_mv = st.battery_mv
         device.battery_pct = _mv_to_pct(st.battery_mv)
+
+    # Raw cumulative flow counter (#59.#3) — record whenever a #59 carries it,
+    # regardless of the flow-active flag, so read_flow can sample its slope even
+    # across a momentary #59.#1=0. It's transient; the gauge value is flow_gpm.
+    if st.flow_total is not None:
+        device.state.flow_total = st.flow_total
 
     if st.is_watering is not None:
         device.state.is_watering = st.is_watering
@@ -240,6 +263,8 @@ def apply_status_plaintext(device, pt: bytes) -> None:
         else:
             device.state.active_zone = None
             device.state.seconds_remaining = None
+            device.state.flow_total = None
+            device.state.flow_gpm = 0.0  # valve closed → no flow
             device.state.started_at = None
             device.state.expected_off_at = None
 
