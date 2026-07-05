@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
+from homeassistant.components.sensor import (
+    RestoreSensor,
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     EntityCategory,
@@ -74,7 +79,25 @@ class _BHyveDeviceSensorBase(CoordinatorEntity[BHyveDeviceCoordinator], SensorEn
         }
 
 
-class BHyveBatterySensor(_BHyveDeviceSensorBase):
+class _RestoreLastValueSensor(_BHyveDeviceSensorBase, RestoreSensor):
+    """Restores its last LIVE reading across a restart, so it shows the last real
+    value instead of blipping to `unavailable` until the first poll. Right for
+    slow-moving battery state (last-known is the sensible default) — and, since we
+    no longer seed battery from the cloud, this is what fills the startup gap. A
+    live device value always wins; `self._restored_value` is only the fallback."""
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        self._restored_value: float | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_sensor_data()
+        if last is not None and last.native_value is not None:
+            self._restored_value = last.native_value
+
+
+class BHyveBatterySensor(_RestoreLastValueSensor):
     _attr_device_class = SensorDeviceClass.BATTERY
     _attr_native_unit_of_measurement = PERCENTAGE
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -86,16 +109,16 @@ class BHyveBatterySensor(_BHyveDeviceSensorBase):
         self._attr_name = "Battery"
 
     @property
-    def native_value(self) -> int | None:
+    def native_value(self) -> float | None:
         device = self.coordinator.device
         if device.battery_pct is not None:
             return device.battery_pct
         if device.battery_mv is not None:
             return _mv_to_pct(device.battery_mv)
-        return None
+        return self._restored_value
 
 
-class BHyveBatteryVoltageSensor(_BHyveDeviceSensorBase):
+class BHyveBatteryVoltageSensor(_RestoreLastValueSensor):
     _attr_device_class = SensorDeviceClass.VOLTAGE
     _attr_native_unit_of_measurement = UnitOfElectricPotential.MILLIVOLT
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -108,8 +131,9 @@ class BHyveBatteryVoltageSensor(_BHyveDeviceSensorBase):
         self._attr_name = "Battery voltage"
 
     @property
-    def native_value(self) -> int | None:
-        return self.coordinator.device.battery_mv
+    def native_value(self) -> float | None:
+        mv = self.coordinator.device.battery_mv
+        return mv if mv is not None else self._restored_value
 
 
 class BHyveRssiSensor(_BHyveDeviceSensorBase):
