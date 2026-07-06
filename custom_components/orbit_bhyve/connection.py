@@ -373,18 +373,23 @@ class BHyveBleConnection:
             except asyncio.TimeoutError:
                 return  # no new frame within the window -> reply complete (or silent)
 
+    async def _write_and_drain(self, plaintext: bytes, drain_ms: int) -> list[bytes]:
+        """Write a command and collect its reply. Caller MUST hold self._lock and
+        have an established, initialised session."""
+        self._notif_buf.clear()
+        await self._write_locked(plaintext)
+        await self._drain(drain_ms)
+        received = list(self._notif_buf)
+        self._notif_buf.clear()
+        self._arm_idle_timer()
+        return received
+
     async def send(self, plaintext: bytes, *, drain_ms: int = 1500) -> list[bytes]:
         """Encrypt + WRITE_REQ + drain notifications until the reply goes quiet
         (bounded by `drain_ms`). Returns the raw notification frames received."""
         async with self._lock:
             await self.ensure_connected()
-            self._notif_buf.clear()
-            await self._write_locked(plaintext)
-            await self._drain(drain_ms)
-            received = list(self._notif_buf)
-            self._notif_buf.clear()
-            self._arm_idle_timer()
-            return received
+            return await self._write_and_drain(plaintext, drain_ms)
 
     async def send_raw(self, plaintext: bytes) -> None:
         """Encrypt + WRITE_REQ with no notification drain. For init-step
@@ -405,18 +410,26 @@ class BHyveBleConnection:
         async with self._lock:
             if self.is_connected and self._handshaken:
                 # Pooled connection — refresh the (possibly stale) bind in place.
-                if self._post_handshake_hook is not None:
-                    await self._post_handshake_hook(self)
-            else:
-                # Cold — ensure_connected() retries the open and runs the hook.
-                await self.ensure_connected()
-            self._notif_buf.clear()
-            await self._write_locked(plaintext)
-            await self._drain(drain_ms)
-            received = list(self._notif_buf)
-            self._notif_buf.clear()
-            self._arm_idle_timer()
-            return received
+                # Over an ESPHome BLE proxy the link can be dead at the GATT layer
+                # while HA still believes the session is pooled/up, so the in-place
+                # bind-refresh or write raises BleakError("Not connected"). Drop the
+                # stale session and retry once on a fresh handshake rather than
+                # surfacing the error to the service call. (The mesh path has no
+                # equivalent self-retry — it relies on this.)
+                try:
+                    if self._post_handshake_hook is not None:
+                        await self._post_handshake_hook(self)
+                    return await self._write_and_drain(plaintext, drain_ms)
+                except (BleakError, asyncio.TimeoutError) as err:
+                    _LOGGER.debug(
+                        "%s: pooled actuation failed (%s) — reconnecting for a fresh session",
+                        self.mac, err,
+                    )
+                    await self.disconnect()
+            # Cold, or the pooled refresh above failed — ensure_connected() retries
+            # the open and runs the post-handshake hook on a fresh session.
+            await self.ensure_connected()
+            return await self._write_and_drain(plaintext, drain_ms)
 
 
 class BleNotConnectable(Exception):
