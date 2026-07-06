@@ -650,3 +650,60 @@ def test_ctr_selfheal_ignores_bad_continuation_frame():
     cont = _frame_decrypting_to(conn, b"\x11\x22\x33\x44moredata", conn._rx_ctr)
     conn._on_notify(None, cont)             # continuation: bad header, not first
     assert hass.jobs == []                  # no disconnect scheduled
+
+
+# --- connect/handshake retry is single-level (connection.py) ---------------
+
+def test_ensure_connected_does_not_multiply_retries(monkeypatch):
+    # Regression guard: ensure_connected must NOT wrap _open in a second retry
+    # loop. _open already retries OPEN_MAX_ATTEMPTS times; a nested loop made it
+    # 3x3=9 connect+handshake attempts (~90-150s on a stalling device). A fully
+    # failing open must attempt connect exactly OPEN_MAX_ATTEMPTS times, not N^2.
+    import sys
+    import types as _types
+
+    from orbit_bhyve import connection as conn_mod
+    from orbit_bhyve.connection import BleHandshakeError, OPEN_MAX_ATTEMPTS
+
+    # Stub the function-local HA bluetooth import so _open resolves a device.
+    for name in ("homeassistant", "homeassistant.components",
+                 "homeassistant.components.bluetooth"):
+        monkeypatch.setitem(sys.modules, name, _types.ModuleType(name))
+    monkeypatch.setattr(
+        sys.modules["homeassistant.components.bluetooth"],
+        "async_ble_device_from_address",
+        lambda *a, **k: object(),  # any non-None "in range" device
+        raising=False,
+    )
+
+    calls = {"connect": 0}
+
+    class _FakeClient:
+        is_connected = True
+
+        async def disconnect(self):
+            pass
+
+        async def stop_notify(self, *_a):
+            pass
+
+    async def _fake_establish(*_a, **_k):
+        calls["connect"] += 1
+        return _FakeClient()
+
+    monkeypatch.setattr(conn_mod, "establish_connection", _fake_establish)
+    # No real gatt-settle / inter-attempt backoff sleeps — keep the test instant.
+    async def _no_sleep(*_a, **_k):
+        pass
+    monkeypatch.setattr(conn_mod.asyncio, "sleep", _no_sleep)
+
+    conn = _make_conn()
+
+    async def _always_fail_handshake():
+        raise BleHandshakeError("forced handshake failure")
+    monkeypatch.setattr(conn, "_handshake", _always_fail_handshake)
+
+    with pytest.raises(BleHandshakeError):
+        asyncio.run(conn.ensure_connected())
+
+    assert calls["connect"] == OPEN_MAX_ATTEMPTS  # 3, never 9

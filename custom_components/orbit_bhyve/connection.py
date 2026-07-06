@@ -111,30 +111,21 @@ class BHyveBleConnection:
         self._plaintext_observer = observer
 
     async def ensure_connected(self) -> None:
-        """Connect + handshake if not already pooled, retrying the whole open a
-        few times. On a marginal proxy link the connect succeeds but the
-        handshake GATT exchange can stall; a clean retry usually gets through,
-        and the bounded handshake means we fail cleanly rather than wedging.
-        Call inside a lock if you need exclusive access; idempotent otherwise."""
+        """Connect + handshake if not already pooled. _open() retries the whole
+        connect+handshake OPEN_MAX_ATTEMPTS times internally: on a marginal proxy
+        link the connect succeeds but the handshake GATT exchange can stall, and
+        a clean retry usually gets through while the bounded handshake means we
+        fail cleanly rather than wedging. Call inside a lock if you need
+        exclusive access; idempotent otherwise."""
         if self.is_connected and self._handshaken:
             return
-        last_err: Exception | None = None
-        for attempt in range(1, OPEN_MAX_ATTEMPTS + 1):
-            try:
-                await self._open()
-                return
-            except (BleHandshakeError, asyncio.TimeoutError) as err:
-                last_err = err
-                _LOGGER.debug(
-                    "%s: open attempt %d/%d failed: %s",
-                    self.mac, attempt, OPEN_MAX_ATTEMPTS, err,
-                )
-                await self.disconnect()
-                if attempt < OPEN_MAX_ATTEMPTS:
-                    await asyncio.sleep(0.5)
-        raise BleHandshakeError(
-            f"{self.mac}: handshake failed after {OPEN_MAX_ATTEMPTS} attempts: {last_err}"
-        )
+        # _open() already retries OPEN_MAX_ATTEMPTS times internally; don't wrap
+        # it in a second retry loop or the attempts multiply (3x3=9 handshakes,
+        # ~90-150s on a stalling device). One call = one bounded retry budget.
+        try:
+            await self._open()
+        except (BleHandshakeError, asyncio.TimeoutError) as err:
+            raise BleHandshakeError(f"{self.mac}: handshake failed: {err}") from err
 
     async def _open(self) -> None:
         from homeassistant.components.bluetooth import async_ble_device_from_address
@@ -162,6 +153,8 @@ class BHyveBleConnection:
                     "%s: open attempt %d/%d failed: %s", self.mac, attempt, OPEN_MAX_ATTEMPTS, err
                 )
                 await self.disconnect()  # clean slate so the retry gets a fresh GATT window
+                if attempt < OPEN_MAX_ATTEMPTS:
+                    await asyncio.sleep(0.5)  # space out retries on a marginal link
                 continue
             # Handshake succeeded — run the per-device-class init, then we're open.
             if self._post_handshake_hook is not None:
