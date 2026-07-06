@@ -301,9 +301,12 @@ def apply_status_plaintext(device, pt: bytes) -> None:
                 # Re-anchor the wall-clock auto-close to the device's own
                 # remaining, so a poll-discovered run (program/app/button) gets
                 # a live countdown and closes cleanly even between polls.
-                # Only shift expected_off_at if it is None or if the new expiry
-                # is earlier, preventing the infinite stuck-open drift caused
-                # by firmware that reports static manual run durations.
+                # Guard: only ever move expected_off_at EARLIER, never later, so
+                # a re-discovered / re-reported run can't keep postponing the
+                # close — a wall-clock backstop if the device stops answering
+                # mid-run. (#16.#6.#5 counts down correctly on both families, so
+                # in steady state new_off_at holds ~constant; the guard just
+                # bounds anomalies, not the old #6.#7 static-total mis-read.)
                 new_off_at = datetime.now(timezone.utc) + timedelta(seconds=st.seconds_remaining)
                 if (
                     device.state.expected_off_at is None

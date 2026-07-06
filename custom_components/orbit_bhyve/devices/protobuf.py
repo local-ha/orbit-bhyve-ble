@@ -64,8 +64,9 @@ def _build_start_pb(station_id: int, duration_sec: int) -> bytes:
 _STOP_PB = bytes.fromhex("720408021200")
 
 # #15 {} — empty getDeviceStatus request. Elicits a full #16 status burst even
-# mid-run (solicited RX is reliable where the unsolicited connect-time push is
-# not). This is how we read the REAL run-state after a command: the device
+# mid-run (solicited RX is reliable; the unsolicited connect-time push is
+# suppressed while the device is active — watering or rain-delay). This is how
+# we read the REAL run-state after a command: the device
 # answers a start with a #16 status but answers a stop with only a bare #30 ack
 # (no #16), so without this poll a healthy stop can never be confirmed.
 _REQUEST_STATUS_PB = bytes.fromhex("7a00")
@@ -137,7 +138,8 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         """Send #15{} to elicit a full #16 status burst; the decoded run-state,
         battery, seconds-remaining, and rain-delay fold into self.state via
         _observe_plaintext. This is the canonical mid-run / post-command read —
-        solicited RX is reliable where the unsolicited push is not."""
+        solicited RX is reliable; the unsolicited push is suppressed while the
+        device is active (watering or rain-delay)."""
         if self.connection is None:
             return
         self._status_parsed = False
