@@ -756,6 +756,17 @@ def reassemble_rx(key, iv, base_counter, raw_frames, sweep=32):
 
 # ── decode ──────────────────────────────────────────────────────────────────
 
+def _decode_packed_varints(data):
+    """Decode a packed-repeated-varint byte run into a list of ints."""
+    out, i = [], 0
+    while i < len(data):
+        v, i = _read_varint(data, i)
+        if v is None:
+            break
+        out.append(v)
+    return out
+
+
 def parse_program_body(pb):
     """Decode a #19 WateringProgram body -> ProgramSchedule (or None if malformed)."""
     f = pb_parse(pb)
@@ -783,8 +794,10 @@ def parse_program_body(pb):
     if _pb_field(f, _DM_RUNONCE) is not None:
         day_mode = "once"
 
-    # #8 start times: bare varint on our firmware, but tolerate the echo quirk
-    # where a read re-emits them nested as #8 { #45 = value }.
+    # #8 start times. We WRITE them as individual (non-packed) varints, but the
+    # device ECHOES them back as a PACKED repeated varint (wire 2: a length-
+    # delimited run of concatenated varints) — HW-confirmed on fw0111 (a single
+    # start 55 came back as `#8` bytes `37`). Handle both wire forms.
     start_mins = []
     for num, wire, v in f:
         if num != 8:
@@ -792,9 +805,7 @@ def parse_program_body(pb):
         if wire == 0:
             start_mins.append(v)
         elif isinstance(v, (bytes, bytearray)):
-            m = _pb_field(pb_parse(v), 45)
-            if m is not None:
-                start_mins.append(m)
+            start_mins.extend(_decode_packed_varints(v))
 
     zones = []
     for num, _wire, v in f:
@@ -1400,7 +1411,7 @@ async def _program_set(sess, spec):
     if spec.slot in programs and not programs[spec.slot].empty:
         print(f"  readback: {_fmt_schedule(programs[spec.slot])}")
     else:
-        print(f"  ⚠ slot {letter} not found in read-back — the store may not have taken")
+        print(f"  WARN: slot {letter} not found in read-back — the store may not have taken")
 
     bit = 1 << (spec.slot - 1)
     if not spec.enabled:
@@ -1426,9 +1437,9 @@ async def _program_set(sess, spec):
             ns = datetime.fromtimestamp(conf.next_start_epoch, tz=timezone.utc).astimezone()
             out = (conf.next_start_epoch - conf.device_clock) if conf.device_clock else None
             when = f" at {ns:%Y-%m-%d %H:%M}" + (f" (~{out}s out)" if out else "")
-        print(f"  ✅ enabled {letter}; next start = {_flags_to_slots(conf.next_start_flags)}{when}")
+        print(f"  OK: enabled {letter}; next start = {_flags_to_slots(conf.next_start_flags)}{when}")
     else:
-        print(f"  ⚠ enabled {letter} but the device did not report a next-start "
+        print(f"  WARN: enabled {letter} but the device did not report a next-start "
               "(check the schedule/day-mode)")
 
 
@@ -1475,9 +1486,9 @@ async def ble_program(mac, network_key, action, spec=None, slot=None):
                 programs, _, _ = parse_sync_dump(await sess.request(build_sync_request_protobuf(), window=6.0))
                 sch = programs.get(slot)
                 if sch is None or sch.empty:
-                    print(f"  ✅ slot {letter} cleared")
+                    print(f"  OK: slot {letter} cleared")
                 else:
-                    print(f"  ⚠ slot {letter} still present: {_fmt_schedule(sch)}")
+                    print(f"  WARN: slot {letter} still present: {_fmt_schedule(sch)}")
 
             elif action == "set":
                 await _program_set(sess, spec)

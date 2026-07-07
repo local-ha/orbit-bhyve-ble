@@ -96,16 +96,28 @@ def test_delete_produces_notset_and_parses_empty():
     assert sch.slot == 1 and sch.empty
 
 
-def test_parse_tolerates_echo_quirk_nested_start_time():
-    # a read may re-emit #8 nested as { #45 = value } instead of a bare varint
+def test_parse_decodes_packed_repeated_start_times():
+    # HW-confirmed (fw0111): a #10 read echoes #8 start-times as a PACKED repeated
+    # varint (wire 2), not the individual varints we write. A single start 55 came
+    # back as `#8` bytes `37`; multi-start packs several varints in one field.
     body = (
-        B.pb_field_varint(1, 3)
-        + B.pb_field_bytes(3, B.pb_field_varint(1, 42))
-        + B.pb_field_bytes(8, B.pb_field_varint(45, 1385))   # echo quirk shape
+        B.pb_field_varint(1, 6)
+        + B.pb_field_bytes(3, B.pb_field_varint(1, 0x7F))
+        + B.pb_field_bytes(8, B.pb_varint(360) + B.pb_varint(1080))  # packed
         + B.pb_field_bytes(9, B.pb_field_varint(1, 0) + B.pb_field_varint(2, 120))
     )
     sch = B.parse_program_body(body)
-    assert sch.start_mins == (1385,)
+    assert sch.start_mins == (360, 1080)
+
+
+def test_parse_decodes_packed_single_start_hw_shape():
+    # the exact bytes BTValve03 echoed for `--start 00:55` (start_min 55 = 0x37)
+    body = bytes.fromhex("08061a02087f4201374a040800103c50648a0107434c4954455354")
+    sch = B.parse_program_body(body)
+    assert sch.slot == 6 and sch.name == "CLITEST"
+    assert sch.start_mins == (55,)
+    assert sch.zones == ((0, 60),)
+    assert sch.weekday_mask == 0x7F
 
 
 # --- multi-frame RX reassembly ---------------------------------------------
