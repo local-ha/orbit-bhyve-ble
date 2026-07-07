@@ -172,10 +172,23 @@ behaviorally cross-checked against the operator's action log**, not vendor-confi
 | **Set clock (timestamp-sync)** | `#18 { #1 = "YYYY-MM-DDThh:mm:ss±hh:mm" }` | ISO-8601 local string; sent on connect. Benign liveness check. |
 | **Set / clear rain delay** | `#17 { #1=minutes; #3=expiryUnixUTC; #4=1 }` | `minutes=0` clears. `expiry = deviceClock + minutes·60`. Confirmed 1440=24 h, 2880=48 h. **The device honors `#3` literally and stores `#1` independently** (skew probe 2026-06-30: sent `#1=360 min` with a skewed `#3=clock+1h`; the device echoed back `#1=360` *and* `#3=clock+1h` unchanged — it enforces the absolute `#3`, it does **not** recompute it from `#1`). ⇒ **`#3` must be anchored to the *device* clock** (`#7`), not the host clock; with a clock-skewed device a host-anchored expiry ends the delay early/late by the skew. Keep `#1` and `#3` consistent (`#3 = deviceClock + #1·60`). |
 | **Create / edit / replace program** | `#19 { … }` | Write the full program to its slot (`#1`). **Replace** = write the replacement's content to the target slot — no special opcode. Full schema below. |
-| **Delete program** | `#19 { #1=slot; #17=name; #10/#14/#15/#16/#21; *no* #8, *no* #9 }` | A slot write stripped of start times (`#8`) and zone durations (`#9`) clears the slot. Confirmed deleting two programs (slots A and C). |
+| **Delete program** | `#19 { #1=slot; #2 {} }` | Write `programTypeNotSet` (`#2` empty) to the slot — clears it to empty. HW-verified 2026-07-06 (`9a010408041200` cleared slot D; `#10` readback showed `#2` NotSet). (The old app capture also cleared slots by stripping `#8`/`#9`; writing `#2 {}` is the clean canonical form.) |
 | **Subscribe / unsubscribe flow** | `#57 { #1=intervalMs; #2=type }` | **Subscribe** = `#57 { #1=1000; #2=2 }` (protobuf `ca030508e8071002`) → device streams periodic `#59` ~1/s. **This is a PERSISTENT stream** that survives reconnects and, crucially, **suppresses the `#16` status response** — while subscribed, `#15` returns only `#59`, never `#16` (hardware, 2026-07-03: a valve left subscribed answered every `#15` with `#59`/`run_state=None`, and unbounded per-poll re-subscription eventually **wedged** it). **Unsubscribe** = `#57 { #1=0; #2=2 }` (interval 0, protobuf `ca030408001002`) — **verified 2026-07-03**: after sending it the `#59` stream stopped and the very next `#15` returned a clean full `#16` (`run_state=1`). So any flow read MUST unsubscribe when done. Implemented as CLI `flow` + HA `read_flow()` (Gen2 only, `has_flow`), which always sends `#57{#1=0}` in a `finally`. **Flow is Gen2-only — hardware-confirmed 2026-07-02:** `#57` to the XD (`44:67:55:D8:55:D2`) yielded **zero `#59`** over 10 s vs. 7 frames from a Gen2. |
-| Program commit/refresh | `#20 { #1=n }` | Small follow-up after a program write (`n` varies 8/9/12/13) — a list version/commit, not the core op. |
+| **Enable programs** | `#20 { #1=activeProgramFlags }` | **Program-ENABLE bitmask** (corrected 2026-07-06 — NOT a "commit"). uint32 bitmask, program **A = bit 0** (`1 << (slot-1)`: A=1, B=2, C=4, D=8, E=16); write the OR of all enabled slots, `#1=0` disables all. The `n` values 8/9/12/13 recorded earlier were bitmasks. Also `#2 lastChangeDateSecEpochUtc`, `#3 lastChangeId`. Returned on read too (via `#10`/`#77`). |
+| **Sync request (full dump)** | `#10 {}` (empty) | **The program-READ path.** One `#10` streams a full state dump: every `#19` program slot + a `#16` status block + the `#20` enable bitmask (+ `#29` settings) as back-to-back messages. Verified on XD + Gen2 (2026-07-06): 9 frames → 9 CRC-valid messages, all 6 slots (A–F) returned. A strict superset of `#15` (heavier; keep `#15` for the routine poll). |
+| **Read enable state** | `#77 {}` (empty) | Cheap targeted read — replies with just the `#20` enable bitmask (`getActivePrograms`). |
+| **Set controller mode** | `#14 { #1=mode; #2={} }` | **Device-global.** `mode 1`=autoMode ("Enable Watering", normal resting state), `0`=offMode ("controller off / automatic watering disabled"), `2`=manualMode (with `#2.#3`=start a station; empty `#2`=stop). **The empty `#2` (`12 00`) is REQUIRED** — a `#14` omitting field 2 is silently ignored. Byte refs: auto `720408011200`, off `720408001200`, stop `720408021200`. **RULE: never leave the controller in offMode after a run/stop/cleanup — stop with `#14{2,{}}` and return to autoMode(1).** |
+| **Identify (LED locate)** | `#47 { #1=seconds }` | Gen2 (fw0111): `#1>0` starts a red flash and **LATCHES**, `#1=0` stops it; custom `#3` color sequence ignored. XD (fw0107, LCD): **no-op**. Fire-and-forget (no reply). |
+| **Close connection** | `#11 {}` | Graceful pre-disconnect; empty body valid; no reply, no desync. |
 | Connect-time queries | `#15 {}`, `#22 {}`, `#45 {}`, `#120 {}` (empty), `#18` clock, `#75 {#1=unixTs; #2=mask}`, `#19` reads of existing programs, device-info → RX `#23` | Sent during the handshake to sync clock + read current state. |
+
+**Making a program run — the 3-write handshake (HW-verified 2026-07-06, both families).** A stored
+program does not run by itself. In order, then store+enable re-sent: **(1) store** `#19` (full body);
+**(2) enable** `#20 { #1=1<<(slot-1) }`; **(3) run-mode** `#14 { #1=1 (auto); #2={} }`. The device
+computes a next-start only if store+enable arrive **while already in autoMode**, so the app does
+store→enable→autoMode→**re-send store+enable**, then reads `#16.#9 nextStartProgramFlags` /
+`#16.#10 nextStartTimeSecEpochUTC` to confirm. **No `getProgramSchedule` exists over BLE** — reads
+go through `#10` (above), not write-and-echo.
 
 ### Watering program message (`#19`)
 
@@ -183,27 +196,35 @@ Captured by editing one advanced program (name `OurAdvancedProgram`) through eve
 
 | Field | Meaning | Observed |
 |---|---|---|
-| `#1` | program **slot id** | A=`1`, B=`2`, C=`3`, D=`4` |
-| `#8` (repeated varint) | **start times**, minutes-of-day | `360` (06:00), `1080` (18:00) |
-| `#9 { #1=zoneIndex; #2=runSec }` (repeated) | **per-zone run durations** | Z0=300, Z1=420, Z2=540, Z3=660 (5/7/9/11 min) |
+| `#1` | program **slot id** (`programId` enum) | 0=manual, A=`1`, B=`2`, C=`3`, D=`4`, E=`5`, F=`6` |
+| `#2` | `programTypeNotSet {}` | present on an **empty / deleted** slot (delete = write `{ #1=slot; #2={} }`) |
+| `#8` (repeated varint) | **start times**, minutes-of-day (device-local) | `360` (06:00), `1080` (18:00); round-trips via `#10` readback |
+| `#9 { #1=zoneIndex; #2=runSec; #3=groupId }` (repeated) | **per-zone run durations** | Z0=300, Z1=420, Z2=540, Z3=660 (5/7/9/11 min); multi-zone round-trips |
 | `#10` | budget / seasonal-adjust % | `100` |
-| `#11` | schedule **start** date (Unix) | set |
-| `#12` | schedule **end** date (Unix) | present for a date; **omitted ⇒ "Never"** |
+| `#11` / `#12` | ⚠ **DEPRECATED** startDate/stopDate | cloud-managed; not stored on our fleet (current pair is `#21`/`#22`) |
+| `#13` / `#14` | lastChangeDate / lastChangeId (`InterfaceId`) | `#14=2` (wifiInterface) on seeded slots |
 | `#17` | program **name** (UTF-8) | `OurAdvancedProgram` |
-| `#14`,`#15`,`#16`,`#18`,`#21`,`#22` | enable/flags + date boundaries | small varints / midnight Unix ts |
+| `#18` | `intervalHours` | `0` on slot B |
+| `#19` / `#20` | `basicProgramMode` / `databaseId` (inner scope) | note: this inner `#20` is **not** the enable message |
+| `#21` / `#22` | `originDateSecEpochUtc` / `endDateSecEpochUtc` | current schedule anchor/end (none stored locally on our fleet) |
 
 **Watering-days mode (mutually exclusive — exactly one present):**
 
 | Mode | Encoding | Evidence |
 |---|---|---|
 | Specific weekdays | `#3 { #1 = bitmask }`, **bit0=Sun … bit6=Sat** | all=`127`, Mon/Wed/Fri=`42` (bits 1,3,5) |
-| Every N days | `#4 { #1 = N; #2 = anchor ISO date }` | N=`3` |
+| Every N days | `#4 { #1 = N; #2 = anchor ISO date }` | N=`3`; `#4.#2` is marked deprecated in knobunc's schema but is **still LIVE on fw0107/0111** (slot B populated it, `#21 originDate` was not) — emit `#4.#2` |
 | Odd days | `#5 {}` (empty marker) | — |
 | Even days | `#6 {}` (empty marker) | — |
+| Run once | `#7 { #1 = programFlags }` | `programTypeRunOnce` (knobunc/anahnymous) |
 
 ### RX additions (device→host, on `6c73`)
 
-- **Run-state `#16.#1`:** extend the table to `1`=idle, **`3`=rain-delay active**, `4`=manual running.
+- **Run-state `#16.#1`:** extend the table to `1`=idle, **`3`=rain-delay active**, `4`=running
+  (manual **or** program — HW-verified 2026-07-06 an auto/program run also reports `#16.#1=4`, so
+  `is_watering` covers program runs). `0`=controller off (offMode). A **program** run is
+  distinguishable from a manual run by `#16.#2.#1` (the echoed `timerMode.mode`): **1=auto** on a
+  scheduled/program run, **2=manual** on a manual run.
 - **`#16.#13` rain-delay status:** `{ #1=minutes, #3=expiryUnix, #4=enabled(0/1) }` — echoes the
   `#17` set command. **Clear shapes vary and `#4` is often absent** (hardware-confirmed
   2026-06-30): an idle read may return `{ #1=0, #4=0 }`, but a **freshly cleared** delay echoes a
@@ -235,6 +256,17 @@ Captured by editing one advanced program (name `OurAdvancedProgram`) through eve
   - **Now fixed here:** HA `devices/status.py` and CLI `scripts/bhyve.py:extract_status` both read
     `#16.#6.#5` → `seconds_remaining` (counts down), plus `#16.#2.#2.#3.#1` → `active_zone`
     (`e0aa80b`); the wall-clock auto-close + drift-guard remain as a safety net.
+- **`#16.#9 nextStartProgramFlags` / `#16.#10 nextStartTimeSecEpochUTC`** — populated whenever a
+  program is enabled: `#9` is the slot bitmask that fires next (A=bit0), `#10` its epoch. This is the
+  **success signal for the run-handshake** (HW 2026-07-06: after enabling slot D, `#9=8` and
+  `#10=clock+90s`) and a natural HA "next run" sensor. On fire, `#10` rolls forward to the next
+  occurrence.
+- **`#16.#7 faultStatus`** (knobunc `OrbitPbApi_FaultStatus`) — an **empty message means no faults**;
+  scalar bools flag specific faults: `#6 valveOnNoFlowDetected` ("No Flow", HW-sampled 2026-07-06 on a
+  dry Gen2 valve — **sticky**, needs a real wet run/reset to clear), `#5 valveOffFlowDetected`, `#7`
+  low, `#8` high, `#1 pumpFault`, `#4 voltageBoostCircuitFail`, `#10 batteryFault`. Feeds the Goal's
+  "Alerts & status" sensor. (Note: a fault does **not** light the Gen2 red LED — that's `#47` identify.)
+- **`#16.#12 programDelayType`** — why a program is delayed: 0 none / 1 user / 2 rain / 3 wind / 4 freeze.
 - **`#19` program** is echoed back on read/save (start times re-emitted as `#8 { #45 = value }`).
 - **`#30`** small command ack around start/stop/clear. **A stop reply is *only* this bare ack**
   (hardware-confirmed 2026-06-30: `f201 02 0801` = `#30 { #1=1 }`) — it carries **no `#16` status

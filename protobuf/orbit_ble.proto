@@ -96,28 +96,43 @@ message OrbitBleMessage {
   optional bytes  bdAddress    = 1;   // device MAC (6 bytes), present on RX
   optional uint32 deviceClock  = 7;   // Unix epoch seconds (RX)
 
-  optional TimerMode       timerMode      = 14;  // TX start/stop; RX active-run echo
+  optional SyncRequest     syncRequest    = 10;  // TX: empty -> full state dump (all #19 slots + #16 + #20)
+  optional CloseConnection closeConnection = 11; // TX graceful pre-disconnect (empty body valid)
+  optional TimerMode       timerMode      = 14;  // TX start/stop/controller-mode; RX active-run echo
   optional StatusRequest   statusRequest  = 15;  // TX: empty -> elicits a status burst
   optional DeviceStatus    deviceStatus   = 16;  // RX device state block
   optional SetRainDelay    rainDelay      = 17;  // TX set/clear rain delay
   optional SetClock        setClock       = 18;  // TX timestamp-sync (ISO-8601 string)
   optional WateringProgram program        = 19;  // TX/RX program create/edit/replace/delete/read
-  optional ProgramCommit   programCommit  = 20;  // TX small follow-up after a program write
+  optional SetActivePrograms setActivePrograms = 20; // TX/RX program-enable bitmask (A=bit0)
   optional DeviceInfo      deviceInfo     = 23;  // RX model / firmware
   optional WateringStatus  wateringStatus = 30;  // RX bare watering-status ack (e.g. stop -> {#1=1})
   optional BatteryReport   batteryReport  = 46;  // RX standalone battery
+  optional IdentifyDevice  identifyDevice = 47;  // TX LED locate (Gen2 only; XD no-op)
   optional StatusSubscribe statusSubscribe = 57; // TX poll/subscribe -> periodic #59
   optional FlowSensorData  flowSensorData = 59;  // RX periodic flow sensor data (Gen2 only)
+  optional GetActivePrograms getActivePrograms = 77; // TX: empty -> #20 enable-bitmask read
+  optional ProgramSchedules programSchedules = 115; // RX bulk container {#1 setActivePrograms, #2 repeated #19}
 }
 
+// #14 timerMode is a DEVICE-GLOBAL control (not per-program/per-run). HW-verified 2026-07-06:
+//   mode 0 = offMode  ("controller off / automatic watering disabled" in the app)
+//   mode 1 = autoMode ("Enable Watering"; normal resting state — scheduled programs run)
+//   mode 2 = manualMode (with #2.#3 => start that station; #2 EMPTY => stop the current run)
+// The empty manualParams marker (#2 = `12 00`) is REQUIRED: a #14 that omits field 2 is
+// silently ignored. Byte refs: autoMode `720408011200`, offMode `720408001200`, stop `720408021200`.
+// RULE: a program run / stop / cleanup must never leave the controller in offMode — stop a run
+// with mode 2 (empty) and return the controller to autoMode(1). offMode is only an explicit
+// user "turn the whole controller off".
 message TimerMode {
-  optional uint32       mode         = 1;  // 2 = manual
-  optional ManualParams manualParams = 2;  // empty => stop
+  optional uint32       mode         = 1;  // 0=off, 1=auto, 2=manual
+  optional ManualParams manualParams = 2;  // present (may be empty) is REQUIRED
 }
 message ManualParams { optional StationInfo stationInfo = 3; }
 message StationInfo {
   optional uint32 stationId  = 1;  // zone - 1 (0..3 on the XD)
   optional uint32 runTimeSec = 2;
+  optional uint32 groupId    = 3;  // concurrent-program group (knobunc); 0 on our fleet
 }
 
 message StatusRequest {}  // sent empty; works mid-run
@@ -134,11 +149,26 @@ message SetRainDelay {
 message SetClock { optional string localIso8601 = 1; }  // "YYYY-MM-DDThh:mm:ss±hh:mm"
 
 message DeviceStatus {
-  optional uint32       mode       = 1;   // 1=idle, 3=rain-delay, 4=manual running
-  optional TimerMode    activeRun  = 2;   // echo of the running manual command
+  optional uint32       mode       = 1;   // 1=idle, 3=rain-delay, 4=running (manual OR program)
+  optional TimerMode    activeRun  = 2;   // echo of the running command; #2.#1 = mode (1=auto,2=manual)
   optional RunProgress  progress   = 6;   // run progress, present only while watering
+  optional FaultStatus  faultStatus = 7;  // faults (empty msg => none); knobunc OrbitPbApi_FaultStatus
+  optional uint32       nextStartProgramFlags    = 9;  // bitmask of slot(s) that fire next (A=bit0)
+  optional uint32       nextStartTimeSecEpochUTC = 10; // epoch of the next scheduled start
+  optional uint32       programDelayType = 12; // why a program is delayed: 0 none/1 user/2 rain/3 wind/4 freeze
   optional SetRainDelay rainDelay  = 13;  // current rain-delay status (same shape as #17)
   optional Battery      battery    = 14;  // { #3 = mV }
+}
+// #16.#7 (knobunc OrbitPbApi_FaultStatus). Empty message => no faults. Scalar bools observed;
+// #6 valveOnNoFlowDetected ("No Flow") HW-sampled 2026-07-06 (sticky on a dry valve).
+message FaultStatus {
+  optional bool pumpFault             = 1;
+  optional bool voltageBoostCircuitFail = 4;
+  optional bool valveOffFlowDetected  = 5;
+  optional bool valveOnNoFlowDetected = 6;  // "No Flow"
+  optional bool valveLowFlowDetected  = 7;
+  optional bool valveHighFlowDetected = 8;
+  optional bool batteryFault          = 10;
 }
 // #16.#6 (knobunc: OrbitPbApi_WateringStatus). HW-verified 2026-07-05 on Gen2 fw0111 + XD fw0107.
 message RunProgress {
@@ -172,7 +202,51 @@ message WateringStatus {
   optional uint32 status = 1;  // Status enum: 1 complete, 2 inProgress, 3 pumpDelay, 4 stationComplete,
                                // 5 stationDelay, 6 programPreDelay, 7 programPostDelay
 }
-message ProgramCommit { optional uint32 n = 1; }  // TX #20 list version/commit after a write
+// #20 setActivePrograms — the program-ENABLE bitmask (NOT a "commit"; corrected 2026-07-06 from
+// anahnymous's app decompile + knobunc's schema). activeProgramFlags is a uint32 bitmask, program
+// A = bit 0 (`1 << (slotId-1)`: A=1, B=2, C=4, D=8, E=16). The "n" values 8/9/12/13 we recorded
+// earlier were bitmasks, not a version counter. Written to enable slots; also returned on read
+// (via #10 syncRequest or #77 getActivePrograms) to report which slots are enabled.
+message SetActivePrograms {
+  optional uint32 activeProgramFlags       = 1;  // bitmask, A=bit0
+  optional uint32 lastChangeDateSecEpochUtc = 2;
+  optional uint32 lastChangeId             = 3;  // InterfaceId
+}
+
+// #10 syncRequest — empty request; the device replies with a full state dump: every #19 program
+// slot + a #16 status block + the #20 enable bitmask (+ #29 settings), streamed as back-to-back
+// OrbitBleMessages. This is the program-READ path (no per-slot read / write-and-echo needed).
+message SyncRequest {}
+
+// #77 getActivePrograms — empty request; replies with just the #20 enable bitmask (cheap read).
+message GetActivePrograms {}
+
+// #11 closeConnection — graceful pre-disconnect. Both fields optional; an empty body is valid.
+message CloseConnection {
+  optional uint32 reconnectTimeSec = 1;
+  optional bool   resetTestMode    = 2;
+}
+
+// #47 identifyDevice — LED locate. HW 2026-07-06: on Gen2 (fw0111) #1>0 starts a red flash and
+// LATCHES (identifyTimeSec is not a reliable auto-off); #1=0 stops it. The custom #3 color
+// sequence is ignored by fw0111 (default red only). On the XD (fw0107, LCD) it's a NO-OP.
+// Fire-and-forget: no reply frame, no CTR desync.
+message IdentifyDevice {
+  optional uint32 identifyTimeSec  = 1;  // required; 0 = stop
+  optional uint32 identifyPeriodMs = 2;
+  repeated IdentifySequence identifySequence = 3;
+}
+message IdentifySequence {
+  optional uint32 colorFlags = 1;  // red=0, green=1, blue=2 (bit flags)
+  optional uint32 durationMs = 2;
+}
+
+// #115 programSchedules — bulk container (knobunc OrbitPbApi_ProgramSchedules). Plausible one-shot
+// program-dump shape; on our fleet the #10 dump instead streams independent #19 messages.
+message ProgramSchedules {
+  optional SetActivePrograms setActivePrograms = 1;
+  repeated WateringProgram   programs          = 2;
+}
 
 message DeviceInfo {
   optional uint32 kind     = 1;
@@ -180,29 +254,45 @@ message DeviceInfo {
   optional bytes  firmware = 3;  // packed fw digits
 }
 
-// Watering program (slots A–D). Exactly one of the day-mode fields is set.
-// Create/edit/replace = write the full message to slotId. Delete = write with
-// name + metadata but NO startTimesMin and NO zoneRunTimes (clears the slot).
+// Watering program (slots A–F; A–D exposed). Exactly one of the day-mode fields (#3–#7) is set.
+// Create/edit/replace = write the full message to slotId. Delete = write { slotId; #2 NotSet {} }
+// (clears the slot to programTypeNotSet). A stored program does NOT run on its own — enabling it
+// is the #20/#14 handshake (see SetActivePrograms + TimerMode).
 message WateringProgram {
-  optional uint32          slotId        = 1;   // A=1, B=2, C=3, D=4
+  optional uint32          slotId        = 1;   // programId enum: 0=manual, A=1, B=2, C=3, D=4, E=5, F=6
+  optional EmptyMarker     notSet        = 2;   // programTypeNotSet (empty slot / delete target)
   optional WeekdayMask     weekdays      = 3;   // specific weekdays
   optional IntervalSchedule everyNDays   = 4;   // every N days
   optional EmptyMarker     oddDays       = 5;   // odd calendar days
   optional EmptyMarker     evenDays      = 6;   // even calendar days
-  repeated uint32          startTimesMin = 8;   // start times, minutes-of-day
-  repeated ZoneRunTime     zoneRunTimes  = 9;
-  optional uint32          budgetPct     = 10;  // seasonal adjust %
-  optional uint32          scheduleStart = 11;  // Unix; omit #12 (end) => "Never"
-  optional uint32          scheduleEnd   = 12;
-  optional string          name          = 17;
+  optional RunOnce         runOnce       = 7;   // one-time run (knobunc programTypeRunOnce)
+  repeated uint32          startTimesMin = 8;   // start times, minutes-of-day (device-local)
+  repeated ZoneRunTime     zoneRunTimes  = 9;   // per-zone (StationInfo shape)
+  optional uint32          budgetPct     = 10;  // seasonal adjust % (100 on our fleet)
+  // #11/#12 startDate/stopDate are DEPRECATED in knobunc's schema; the current pair is #21/#22.
+  // None of our devices store a schedule window (cloud-managed) — treat as read-only if present.
+  optional uint32          scheduleStart = 11;  // DEPRECATED startDateSecEpochUtc
+  optional uint32          scheduleEnd   = 12;  // DEPRECATED stopDateSecEpochUtc
+  optional uint32          lastChangeDateSecEpochUtc = 13;
+  optional uint32          lastChangeId  = 14;  // InterfaceId (2 = wifiInterface on our seeded slots)
+  optional string          name          = 17;  // UTF-8
+  optional uint32          intervalHours = 18;  // interval day-mode sub-day period
+  optional bool            basicProgramMode = 19;
+  optional uint32          databaseId    = 20;  // inner scope — NOT the #20 enable message
+  optional uint32          originDateSecEpochUtc = 21;  // current schedule anchor
+  optional uint32          endDateSecEpochUtc    = 22;  // current schedule end
 }
 message WeekdayMask { optional uint32 bitmask = 1; }  // bit0=Sun .. bit6=Sat
 message IntervalSchedule {
-  optional uint32 n         = 1;  // every N days
+  optional uint32 n         = 1;  // every N days (intervalDays)
+  // #2 intervalStartTimeIso8601 is marked DEPRECATED in knobunc's schema but is still LIVE on
+  // fw0107/fw0111 (slot B populated it, #21 originDate was NOT) — our encoder emits #4.#2.
   optional string anchorIso = 2;  // ISO-8601 anchor date
 }
+message RunOnce { optional uint32 programFlags = 1; }
 message EmptyMarker {}
 message ZoneRunTime {
   optional uint32 zoneIndex = 1;
   optional uint32 runSec    = 2;
+  optional uint32 groupId   = 3;  // concurrent-program group (0 on our fleet)
 }
