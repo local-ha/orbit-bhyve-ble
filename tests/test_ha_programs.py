@@ -430,8 +430,8 @@ def _status_idle() -> bytes:
 
 
 class _ScriptedStreamConn:
-    """Returns a scripted list of sync-dump streams, one per send_stream call (so a
-    retry consumes the next). Feeds a canned status on a #15/#75 elicitor."""
+    """Returns a scripted list of sync-dump streams, one per send_stream call. Feeds
+    a canned status on a #15/#75 elicitor. Records send_stream calls in `streamed`."""
 
     def __init__(self, device, streams, status_pt=None):
         self.device = device
@@ -459,25 +459,33 @@ class _ScriptedStreamConn:
         return True
 
 
-def test_read_programs_retries_on_partial_then_succeeds():
-    # A marginal-link read that returns a truncated stream (no #20 mask decoded)
-    # must retry once on a fresh handshake and take the good read.
-    a = tx._build_program_pb(_ha_spec(1, "odd", start_mins=(360,), zones=((0, 60),), name="A"))
-    dev = _make_gen2()
-    dev.connection = _ScriptedStreamConn(dev, streams=[b"", _dump_stream([a], mask=1)])
-    programs = asyncio.run(dev.get_programs())
-    assert 1 in programs and programs[1].enabled is True
-    assert len(dev.connection.streamed) == 2   # retried once
-
-
-def test_read_programs_falls_back_to_last_known_on_double_miss():
-    # Two partial reads in a row must NOT blank the known schedules — get_programs
-    # returns the last-known state.programs, not empty.
+def test_read_programs_keeps_last_known_on_empty_read_no_retry():
+    # A desynced/truncated read yields an empty stream. It must NOT blank the known
+    # schedules, and must NOT retry with an immediate reconnect (that races the
+    # device's single-BLE-session release and wedges the link) — get_programs
+    # returns the last-known state.programs, one send_stream only.
     dev = _make_gen2()
     dev.state.programs = {1: ProgramSummary(slot=1, empty=False, enabled=True, name="Keep")}
-    dev.connection = _ScriptedStreamConn(dev, streams=[b"", b""])
+    dev.connection = _ScriptedStreamConn(dev, streams=[b""])
     programs = asyncio.run(dev.get_programs())
     assert 1 in programs and programs[1].name == "Keep"
+    assert len(dev.connection.streamed) == 1   # no amplifying retry
+
+
+def test_read_programs_populates_bodies_and_carries_enabled_without_mask():
+    # A burst that decodes the #19 bodies but drops the small #20 mask (mask=None)
+    # must still populate the schedule, and carry each slot's KNOWN enabled state
+    # forward rather than reporting it as off/unknown.
+    dev = _make_gen2()
+    dev.state.programs = {1: ProgramSummary(slot=1, empty=False, enabled=True, name="A")}
+    body_only = tx._build_message(
+        tx._build_program_pb(_ha_spec(1, "odd", start_mins=(360,), zones=((0, 60),), name="A"))
+    )  # a #19 message with NO trailing #20 mask
+    dev.connection = _ScriptedStreamConn(dev, streams=[body_only])
+    programs = asyncio.run(dev.get_programs())
+    assert 1 in programs and not programs[1].empty
+    assert programs[1].enabled is True         # carried forward, not blanked to None
+    assert len(dev.connection.streamed) == 1
 
 
 def test_read_programs_empty_device_completes_without_retry():

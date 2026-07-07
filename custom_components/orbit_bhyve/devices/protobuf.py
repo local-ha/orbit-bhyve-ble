@@ -614,33 +614,31 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         is applied to state by the per-frame observer; parse_sync_dump here pulls
         the multi-frame #19 program bodies + the #20 enable bitmask.
 
-        A read is COMPLETE only when the #20 mask decodes (mask is not None): it
-        trails the #19 bodies in the stream, so its presence means the multi-frame
-        reassembly wasn't truncated by a mid-read CTR desync (the header self-heal
-        disconnects on a bad first frame — HW-seen on a marginal-link valve) or a
-        dropped tail frame. A partial read (mask=None, possibly empty or with
-        unknown enabled state) retries ONCE on a fresh handshake, then falls back to
-        the last-known state.programs rather than blanking / de-enabling known
-        schedules. An empty device legitimately returns (mask, programs={})."""
-        mask: int | None = None
-        for attempt in range(2):
-            try:
-                stream = await self.connection.send_stream(
-                    _build_message(_build_sync_request_pb()), drain_ms=6000
-                )
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("%s: program sync read failed: %s", self.mac, err)
-                stream = b""
-            programs, mask, _status = parse_sync_dump(stream)
-            if mask is not None:
-                if programs:
-                    self.state.programs = programs
-                return programs, mask
-            if attempt == 0:
-                # A desync self-heal may already be disconnecting; force a clean
-                # fresh handshake so the retry re-bases the RX counter.
-                await self.connection.disconnect()
-        return self.state.programs, mask
+        Only overwrite state when program BODIES decode: a truncated / CTR-desynced
+        burst (the header self-heal already disconnects on a bad first frame) yields
+        nothing and must NOT blank the last-known schedules. If the bodies decode
+        but the small #20 mask frame dropped (mask=None), carry the known enabled
+        flags forward so a partial burst doesn't spuriously de-enable a slot.
+
+        Do NOT retry with an immediate reconnect here. Orbit valves allow only ONE
+        BLE session, so a fast disconnect+reconnect races the device's session
+        release and can wedge the link into a desync cascade (hardware-observed);
+        the next scheduled poll retries cleanly instead, and get_programs / the
+        sensors read through the retained last-known state.programs meanwhile."""
+        stream = await self.connection.send_stream(
+            _build_message(_build_sync_request_pb()), drain_ms=6000
+        )
+        programs, mask, _status = parse_sync_dump(stream)
+        if programs:
+            if mask is None:
+                # Mask frame dropped on this burst — keep each slot's known enable
+                # state rather than reporting it as unknown/off.
+                for sid, sch in programs.items():
+                    prev = self.state.programs.get(sid)
+                    if sch.enabled is None and prev is not None:
+                        sch.enabled = prev.enabled
+            self.state.programs = programs
+        return programs, mask
 
     async def get_programs(self) -> dict:
         """Public read: connect, dump all slots, disconnect. Returns
