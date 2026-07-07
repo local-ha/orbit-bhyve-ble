@@ -102,7 +102,8 @@ message OrbitBleMessage {
   optional StatusRequest   statusRequest  = 15;  // TX: empty -> elicits a status burst
   optional DeviceStatus    deviceStatus   = 16;  // RX device state block
   optional SetRainDelay    rainDelay      = 17;  // TX set/clear rain delay
-  optional SetClock        setClock       = 18;  // TX timestamp-sync (ISO-8601 string)
+  optional SetClock        setClock       = 18;  // TX ISO-8601 clock (NO-OP over BLE; use #75)
+  optional SetEpochTime    setEpochTime   = 75;  // TX real clock-set (UTC epoch + tz); elicits status
   optional WateringProgram program        = 19;  // TX/RX program create/edit/replace/delete/read
   optional SetActivePrograms setActivePrograms = 20; // TX/RX program-enable bitmask (A=bit0)
   optional DeviceInfo      deviceInfo     = 23;  // RX model / firmware
@@ -152,6 +153,15 @@ message SetRainDelay {
 // (#7, read-only) is cloud/hub-managed and not locally settable. Kept for parity /
 // in case other firmware honors it.
 message SetClock { optional string localIso8601 = 1; }  // #1 currentTimeIso8601, "YYYY-MM-DDThh:mm:ss±hh:mm"
+
+// #75 setEpochTime (knobunc/anahnymous OrbitPbApi_SetEpochTime). THE clock-set that
+// actually works over BLE — HW-verified 2026-07-06 on both fw0111 (Gen2: 20 h drift ->
+// in sync) and fw0107 (XD: a +1 h set took, then restored). The app also sends it on
+// connect to trigger the first status burst. #2 is a SIGNED int32 (e.g. -14400 = EDT).
+message SetEpochTime {
+  optional uint32 timeSecEpochUTC   = 1;
+  optional int32  timezoneOffsetSec = 2;  // signed; local UTC offset in seconds
+}
 
 message DeviceStatus {
   optional uint32       mode       = 1;   // 1=idle, 3=rain-delay, 4=running (manual OR program)

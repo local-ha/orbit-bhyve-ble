@@ -171,14 +171,32 @@ def test_dedup_consecutive_drops_repeat_frame():
     assert B._dedup_consecutive(frames) == [b"\x11\x02\xaa\xbb", b"\x11\x02\xcc\xdd"]
 
 
-# --- clock sync (#18) -------------------------------------------------------
+# --- clock sync (#75 setEpochTime; #18 is a decoy no-op) --------------------
 
-def test_set_clock_builds_iso_local_string():
+def test_set_epoch_time_builds_utc_epoch_and_signed_tz():
+    pb = B.build_set_epoch_time_protobuf(epoch_utc=1783317742, tz_offset_sec=-14400)
+    assert pb[:2].hex() == "da04"  # field 75, wire 2
+    body = B.pb_parse(B._pb_field(B.pb_parse(pb), 75))
+    assert B._pb_field(body, 1) == 1783317742
+    # #2 is a signed int32 read back as an unsigned 64-bit varint
+    raw = B._pb_field(body, 2)
+    signed = raw - (1 << 64) if raw >= (1 << 63) else raw
+    assert signed == -14400
+
+
+def test_signed_varint_negative_low32_is_twos_complement():
+    # the device reads #2 as int32; the low 32 bits must be -14400 (0xFFFFC7C0)
+    body = B.pb_parse(B._pb_field(B.pb_parse(
+        B.build_set_epoch_time_protobuf(epoch_utc=0, tz_offset_sec=-14400)), 75))
+    assert (B._pb_field(body, 2) & 0xFFFFFFFF) == 0xFFFFC7C0
+
+
+def test_set_clock_18_still_builds_iso_but_is_a_known_noop():
     from datetime import datetime, timezone, timedelta
 
     when = datetime(2026, 7, 6, 21, 45, 30, tzinfo=timezone(timedelta(hours=-4)))
     pb = B.build_set_clock_protobuf(when)
-    assert pb[:2].hex() == "9201"  # field 18, wire 2
+    assert pb[:2].hex() == "9201"  # field 18, wire 2 (kept for parity; ignored by fw)
     inner = B.pb_parse(B._pb_field(B.pb_parse(pb), 18))
     assert B._pb_field(inner, 1).decode() == "2026-07-06T21:45:30-04:00"
 

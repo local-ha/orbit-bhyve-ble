@@ -197,6 +197,12 @@ def pb_field_bytes(f, d):
     return pb_varint((f << 3) | 2) + pb_varint(len(d)) + d
 
 
+def pb_field_varint_signed(f, v):
+    """int32/int64 field (non-zigzag). Negatives are sign-extended to 64 bits, so
+    a negative value encodes as a 10-byte varint (matches protobuf's wire format)."""
+    return pb_varint((f << 3) | 0) + pb_varint(v & 0xFFFFFFFFFFFFFFFF if v < 0 else v)
+
+
 def build_start_protobuf(station_id, duration_sec):
     station_info = pb_field_varint(1, station_id) + pb_field_varint(2, duration_sec)
     manual_params = pb_field_bytes(3, station_info)
@@ -230,17 +236,33 @@ def build_request_status_protobuf():
 
 
 def build_set_clock_protobuf(when=None):
-    """Clock-sync: #18 { #1 = 'YYYY-MM-DDThh:mm:ss±hh:mm' } (ISO-8601 LOCAL time).
+    """#18 setDateTime { #1 = 'YYYY-MM-DDThh:mm:ss±hh:mm' } (ISO-8601 local).
 
-    The vendor app sends this on every connect; we never did, so a device that
-    hasn't talked to the app drifts (observed ~20 h off on BTValve03). Defaults
-    to the host's current local time. The device stores it as its wall clock, and
-    program start-times (#8), rain-delay expiry (#3), and the auto-close all key
-    off that clock — so a correct clock is what makes a scheduled program fire at
-    the intended real-world time.
+    NOTE: HW-verified 2026-07-06 that this is a NO-OP over BLE on both fw0107 and
+    fw0111 — the real clock-set is #75 setEpochTime (build_set_epoch_time_protobuf).
+    Kept for parity with the app capture; not used by `clock sync`.
     """
     when = when or datetime.now().astimezone()
     return pb_field_bytes(18, pb_field_bytes(1, when.isoformat(timespec="seconds").encode()))
+
+
+def build_set_epoch_time_protobuf(epoch_utc=None, tz_offset_sec=None):
+    """Clock-sync: #75 setEpochTime { #1 timeSecEpochUTC, #2 timezoneOffsetSec }.
+
+    The device stores a UTC epoch (#1) plus a tz offset in seconds (#2, signed —
+    e.g. -14400 for EDT). This — not #18 setDateTime — is what actually sets the
+    clock over BLE, and the app also uses it to trigger the first status burst on
+    connect. Program start-times (#8), rain-delay expiry (#3), and the auto-close
+    all key off this clock, so a correct clock is what makes a scheduled program
+    fire at the intended real-world time. Defaults to the host's current time/tz.
+    """
+    now = datetime.now().astimezone()
+    if epoch_utc is None:
+        epoch_utc = int(now.timestamp())
+    if tz_offset_sec is None:
+        tz_offset_sec = int(now.utcoffset().total_seconds())
+    body = pb_field_varint(1, epoch_utc) + pb_field_varint_signed(2, tz_offset_sec)
+    return pb_field_bytes(75, body)
 
 
 def build_flow_subscribe_protobuf(interval_ms=1000):
@@ -1384,16 +1406,14 @@ async def ble_clock(mac, network_key, action):
             await client.stop_notify(READ_CHAR)
             return
 
-        # Send the app's #18 setDateTime (best-effort). NOTE: hardware-verified
-        # 2026-07-06 that both fw0107 (XD) and fw0111 (Gen2) IGNORE this over BLE
-        # — the device clock is cloud/hub-managed, not locally settable. We still
-        # send it (harmless, byte-identical to the app; some firmware may honor
-        # it) and then verify whether it actually took.
+        # Set the clock with #75 setEpochTime (the real setter — #18 setDateTime is
+        # a no-op over BLE). Sends UTC epoch + local tz offset, then re-reads to
+        # verify it took.
         now = datetime.now().astimezone()
         collector.decoded.clear()
         collector.event.clear()
-        await send_pb(build_set_clock_protobuf(now))
-        print(f"Clock sync -> {now:%Y-%m-%d %H:%M:%S %z} — sent!")
+        await send_pb(build_set_epoch_time_protobuf())
+        print(f"Clock sync -> {now:%Y-%m-%d %H:%M:%S %z} — sent (#75 setEpochTime)!")
         await _await_rx(collector, first_timeout=4.0)
         collector.decoded.clear()
         collector.event.clear()
