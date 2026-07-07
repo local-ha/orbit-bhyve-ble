@@ -417,6 +417,9 @@ RX_F_BATTERY_REPORT = 46  # standalone battery report { #3 = mV }
 RX_F_WATERING = 59        # watering/flow status { #1 flow-active, #2 seq, #3 cumulative }
 RX_F_WATERING_ACTIVE = 1  #   #59.#1: water CURRENTLY flowing (not "valve open")
 RX_F_FLOW_TOTAL = 3       #   #59.#3: CUMULATIVE volume counter for this run (Gen2)
+RX_F_RUNECHO_MODE = 1     #   #16.#2.#1: timerMode.mode (0=off, 1=auto, 2=manual)
+RX_F_STATUS_NEXTSTART_FLAGS = 9   # #16.#9: nextStartProgramFlags (slot bitmask, A=bit0)
+RX_F_STATUS_NEXTSTART = 10        # #16.#10: nextStartTimeSecEpochUTC
 
 # #59.#3 is a cumulative per-run volume counter in raw device units, not gpm.
 # Divide by this to get gallons. MEASURED 2026-07-03 (BTValve01): a 44.5 s window
@@ -436,6 +439,9 @@ class DeviceStatus(NamedTuple):
     rain_delay_minutes: int | None = None  # #16.#13.#1
     rain_delay_expiry: int | None = None   # #16.#13.#3, Unix epoch seconds
     rain_delay_active: bool | None = None  # #16.#13.#4
+    controller_mode: int | None = None     # #16.#2.#1 timerMode.mode: 0=off, 1=auto, 2=manual
+    next_start_flags: int | None = None    # #16.#9 nextStartProgramFlags (slot bitmask, A=bit0)
+    next_start_epoch: int | None = None    # #16.#10 nextStartTimeSecEpochUTC
 
 
 def _pb_field(fields, num):
@@ -473,12 +479,16 @@ def extract_status(protobuf):
     run_state = battery_mv = is_watering = None
     active_station = seconds_remaining = None
     rd_minutes = rd_expiry = rd_active = None
+    controller_mode = next_start_flags = next_start_epoch = None
 
     status = _pb_field(top, RX_F_STATUS)          # #16 submessage
     if isinstance(status, (bytes, bytearray)):
         sfields = pb_parse(status)
         run_state = _pb_field(sfields, RX_F_STATUS_MODE)
         battery_mv = _pb_subfield(sfields, RX_F_STATUS_BATT, RX_F_BATT_MV)  # #16.#14.#3
+        controller_mode = _pb_path(sfields, RX_F_STATUS_RUNECHO, RX_F_RUNECHO_MODE)  # #16.#2.#1
+        next_start_flags = _pb_field(sfields, RX_F_STATUS_NEXTSTART_FLAGS)  # #16.#9
+        next_start_epoch = _pb_field(sfields, RX_F_STATUS_NEXTSTART)        # #16.#10
         # Which zone is running: prefer the shallow #16.#6.#4, fall back to the
         # deep timerMode path #16.#2.#2.#3.#1.
         active_station = _pb_subfield(sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_STATION)
@@ -533,7 +543,351 @@ def extract_status(protobuf):
         rain_delay_minutes=rd_minutes,
         rain_delay_expiry=rd_expiry,
         rain_delay_active=rd_active,
+        controller_mode=controller_mode,
+        next_start_flags=next_start_flags,
+        next_start_epoch=next_start_epoch,
     )
+
+
+# ─── Watering programs (#19 / #20 / #14 / #10) ─────────────────────────────
+#
+# See docs/ble_protocol.md and protobuf/orbit_ble.proto. Reads use #10 syncRequest
+# (a one-shot full dump — every #19 slot + #16 status + the #20 enable bitmask),
+# reassembled from a multi-frame RX burst. Writes/runs use the 3-write handshake:
+# store #19 -> enable #20 -> autoMode #14{1} -> re-send store+enable, confirmed via
+# #16.#9/#10 next-start. This module is the reference the HA layer mirrors.
+
+PROGRAM_SLOTS = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6}
+SLOT_LETTERS = {v: k for k, v in PROGRAM_SLOTS.items()}
+
+# day-mode field numbers inside a #19 body (exactly one is present)
+_DM_WEEKDAYS = 3   # { #1 dayFlags }  bit0=Sun .. bit6=Sat
+_DM_INTERVAL = 4   # { #1 intervalDays, #2 anchorIso }
+_DM_ODD = 5        # {} empty marker
+_DM_EVEN = 6       # {} empty marker
+_DM_RUNONCE = 7    # { #1 programFlags }  (unverified on our hardware)
+
+WEEKDAY_BITS = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+WEEKDAY_NAMES = {v: k for k, v in WEEKDAY_BITS.items()}
+
+
+class ProgramSpec(NamedTuple):
+    """A program to write (CLI zones are 1-indexed; `zones` here are 0-indexed
+    station ids for the wire)."""
+    slot: int                            # 1=A .. 6=F
+    day_mode: str                        # "weekdays" | "interval" | "odd" | "even" | "once"
+    weekday_mask: int | None = None      # weekdays: bit0=Sun .. bit6=Sat
+    interval_days: int | None = None     # interval: N
+    interval_anchor: str | None = None   # interval: ISO-8601 anchor
+    start_mins: tuple = ()               # minutes-from-midnight (device-local)
+    zones: tuple = ()                    # (station_id_0idx, run_sec)
+    name: str = ""
+    budget: int = 100
+    enabled: bool = False                # drive the enable handshake after storing
+
+
+class ProgramSchedule(NamedTuple):
+    """A #19 program body decoded from a device read."""
+    slot: int | None
+    empty: bool                          # #2 programTypeNotSet present -> empty slot
+    day_mode: str | None = None
+    weekday_mask: int | None = None
+    interval_days: int | None = None
+    interval_anchor: str | None = None
+    start_mins: tuple = ()
+    zones: tuple = ()                    # (station_id_0idx, run_sec)
+    name: str | None = None
+    budget: int | None = None
+    enabled: bool | None = None          # filled from the #20 bitmask, not the #19 body
+
+
+# ── builders ────────────────────────────────────────────────────────────────
+
+def build_sync_request_protobuf():
+    """#10 syncRequest {} — empty; device replies with a full state dump."""
+    return pb_field_bytes(10, b"")
+
+
+def build_get_active_programs_protobuf():
+    """#77 getActivePrograms {} — empty; device replies with just the #20 bitmask."""
+    return pb_field_bytes(77, b"")
+
+
+def build_set_active_programs_protobuf(flags):
+    """#20 setActivePrograms { #1 activeProgramFlags } — the enable BITMASK
+    (A=bit0: 1<<(slot-1)). The device fills #2/#3 lastChange* itself."""
+    return pb_field_bytes(20, pb_field_varint(1, flags))
+
+
+def build_set_timer_mode_protobuf(mode):
+    """#14 timerMode { #1 mode, #2 {} EMPTY } — DEVICE-GLOBAL controller mode.
+
+    mode 0=offMode ("controller off / automatic watering disabled"), 1=autoMode
+    ("Enable Watering", the normal resting state — scheduled programs run),
+    2=manualMode (empty #2 => stop the current run). The empty #2 marker (`12 00`)
+    is REQUIRED — a #14 that omits it is silently ignored.
+    """
+    return pb_field_bytes(14, pb_field_varint(1, mode) + pb_field_bytes(2, b""))
+
+
+def build_program_protobuf(spec):
+    """#19 setProgramSchedule from a ProgramSpec (a full, runnable program)."""
+    body = pb_field_varint(1, spec.slot)
+    if spec.day_mode == "weekdays":
+        body += pb_field_bytes(_DM_WEEKDAYS, pb_field_varint(1, spec.weekday_mask or 0))
+    elif spec.day_mode == "interval":
+        iv = pb_field_varint(1, spec.interval_days or 1)
+        if spec.interval_anchor:
+            iv += pb_field_bytes(2, spec.interval_anchor.encode())
+        body += pb_field_bytes(_DM_INTERVAL, iv)
+    elif spec.day_mode == "odd":
+        body += pb_field_bytes(_DM_ODD, b"")
+    elif spec.day_mode == "even":
+        body += pb_field_bytes(_DM_EVEN, b"")
+    elif spec.day_mode == "once":
+        body += pb_field_bytes(_DM_RUNONCE, pb_field_varint(1, 1 << (spec.slot - 1)))
+    for m in spec.start_mins:
+        body += pb_field_varint(8, m)
+    for sid, sec in spec.zones:
+        body += pb_field_bytes(9, pb_field_varint(1, sid) + pb_field_varint(2, sec))
+    body += pb_field_varint(10, spec.budget)
+    if spec.name:
+        body += pb_field_bytes(17, spec.name.encode())
+    return pb_field_bytes(19, body)
+
+
+def build_program_delete_protobuf(slot):
+    """Clear a slot to empty: #19 { #1 slot, #2 {} } (programTypeNotSet, no #8/#9)."""
+    return pb_field_bytes(19, pb_field_varint(1, slot) + pb_field_bytes(2, b""))
+
+
+# ── multi-frame RX reassembly (mirrored in HA connection.py) ─────────────────
+
+def _count_rx_blocks(raw_frames):
+    """Number of 16-byte CTR blocks a burst of frames consumes (the amount the RX
+    counter advances across them)."""
+    n = 0
+    for raw in raw_frames:
+        parsed = parse_ble_frame(raw)
+        if parsed is not None:
+            n += (parsed[0] + 15) // 16 or 1
+    return n
+
+
+def _dedup_consecutive(frames):
+    """Drop a byte-identical re-delivery of the previous frame (a proxy dup that
+    would otherwise advance rx_ctr and desync the stream)."""
+    out = []
+    for f in frames:
+        if not out or f != out[-1]:
+            out.append(f)
+    return out
+
+
+def _split_inner_messages(stream):
+    """Scan a decrypted byte stream for every `aa775a0f`-headed inner message.
+
+    The device packs back-to-back messages contiguously (NOT block-padded), so
+    one outer frame is not necessarily one message and a message may span frames.
+    Returns [{offset, total, crc_ok, protobuf}].
+    """
+    msgs = []
+    i = 0
+    while i + 6 <= len(stream):
+        hdr = stream.find(MSG_HEADER, i)
+        if hdr < 0 or hdr + 6 > len(stream):
+            break
+        payload_len = stream[hdr + 4]
+        total = payload_len + 6
+        if payload_len < 2 or hdr + total > len(stream):
+            break  # incomplete trailing message
+        inner = decode_inner(stream[hdr:hdr + total])
+        msgs.append({
+            "offset": hdr,
+            "total": total,
+            "crc_ok": bool(inner and inner["crc_ok"]),
+            "protobuf": inner["protobuf"] if inner else None,
+        })
+        i = hdr + total
+    return msgs
+
+
+def reassemble_rx(key, iv, base_counter, raw_frames, sweep=32):
+    """Rebuild the per-direction plaintext stream from a burst of 0x11 frames and
+    split it into inner messages.
+
+    A long inner message streams as consecutive 16-byte CTR blocks, each in its
+    own outer frame, the RX counter advancing per block across all frames. We
+    decrypt frame-by-frame at a block-aligned running counter, concatenate, then
+    scan for headers. The base counter is swept (a prior push may have consumed
+    some) and the base yielding the most CRC-valid messages wins. Returns
+    (best_base, stream, messages).
+    """
+    cts = []
+    for raw in raw_frames:
+        parsed = parse_ble_frame(raw)
+        if parsed is not None:
+            cts.append(parsed[1])
+    if not cts:
+        return base_counter, b"", []
+
+    def decode_at(base):
+        parts, blocks = [], 0
+        for ct in cts:
+            pt, _ = aes_encrypt(key, iv, (base + blocks) % 0x100000000, ct)
+            parts.append(pt)
+            blocks += (len(ct) + 15) // 16 or 1
+        stream = b"".join(parts)
+        msgs = _split_inner_messages(stream)
+        return stream, msgs, sum(1 for m in msgs if m["crc_ok"])
+
+    best = None
+    for d in range(sweep):
+        for base in ((base_counter + d) % 0x100000000,
+                     (base_counter - d) % 0x100000000):
+            stream, msgs, score = decode_at(base)
+            if best is None or score > best[0]:
+                best = (score, base, stream, msgs)
+            if d == 0:
+                break
+    _score, base, stream, msgs = best
+    return base, stream, msgs
+
+
+# ── decode ──────────────────────────────────────────────────────────────────
+
+def parse_program_body(pb):
+    """Decode a #19 WateringProgram body -> ProgramSchedule (or None if malformed)."""
+    f = pb_parse(pb)
+    if f is None:
+        return None
+    slot = _pb_field(f, 1)
+    notset = _pb_field(f, 2)
+    empty = isinstance(notset, (bytes, bytearray))  # #2 programTypeNotSet present
+
+    day_mode = weekday_mask = interval_days = interval_anchor = None
+    wk = _pb_field(f, _DM_WEEKDAYS)
+    if isinstance(wk, (bytes, bytearray)):
+        day_mode, weekday_mask = "weekdays", _pb_field(pb_parse(wk), 1)
+    iv = _pb_field(f, _DM_INTERVAL)
+    if isinstance(iv, (bytes, bytearray)):
+        ivf = pb_parse(iv)
+        day_mode, interval_days = "interval", _pb_field(ivf, 1)
+        anchor = _pb_field(ivf, 2)
+        if isinstance(anchor, (bytes, bytearray)):
+            interval_anchor = anchor.decode(errors="replace")
+    if _pb_field(f, _DM_ODD) is not None:
+        day_mode = "odd"
+    if _pb_field(f, _DM_EVEN) is not None:
+        day_mode = "even"
+    if _pb_field(f, _DM_RUNONCE) is not None:
+        day_mode = "once"
+
+    # #8 start times: bare varint on our firmware, but tolerate the echo quirk
+    # where a read re-emits them nested as #8 { #45 = value }.
+    start_mins = []
+    for num, wire, v in f:
+        if num != 8:
+            continue
+        if wire == 0:
+            start_mins.append(v)
+        elif isinstance(v, (bytes, bytearray)):
+            m = _pb_field(pb_parse(v), 45)
+            if m is not None:
+                start_mins.append(m)
+
+    zones = []
+    for num, _wire, v in f:
+        if num == 9 and isinstance(v, (bytes, bytearray)):
+            zf = pb_parse(v)
+            zones.append((_pb_field(zf, 1), _pb_field(zf, 2)))
+
+    name = _pb_field(f, 17)
+    if isinstance(name, (bytes, bytearray)):
+        name = name.decode(errors="replace")
+    return ProgramSchedule(
+        slot=slot, empty=empty, day_mode=day_mode, weekday_mask=weekday_mask,
+        interval_days=interval_days, interval_anchor=interval_anchor,
+        start_mins=tuple(start_mins), zones=tuple(zones), name=name,
+        budget=_pb_field(f, 10),
+    )
+
+
+def parse_sync_dump(msgs):
+    """From a reassembled #10 dump, return (programs {slot:ProgramSchedule},
+    active_mask int|None, status DeviceStatus|None). `enabled` is filled on each
+    program from the #20 bitmask."""
+    programs, active_mask, status = {}, None, None
+    for m in msgs:
+        pb = m.get("protobuf")
+        if not pb:
+            continue
+        top = pb_parse(pb)
+        if top is None:
+            continue
+        p19 = _pb_field(top, 19)
+        if isinstance(p19, (bytes, bytearray)):
+            sch = parse_program_body(p19)
+            if sch and sch.slot is not None:
+                programs[sch.slot] = sch
+        p20 = _pb_field(top, 20)
+        if isinstance(p20, (bytes, bytearray)):
+            active_mask = _pb_field(pb_parse(p20), 1)
+        if isinstance(_pb_field(top, 16), (bytes, bytearray)):
+            status = extract_status(pb)
+    if active_mask is not None:
+        for sid, sch in list(programs.items()):
+            programs[sid] = sch._replace(enabled=bool(active_mask & (1 << (sid - 1))))
+    return programs, active_mask, status
+
+
+def _first_status(msgs):
+    """Return the first DeviceStatus from a reassembled burst that carries #16
+    (run-state or controller-mode), else None."""
+    for m in msgs:
+        pb = m.get("protobuf")
+        if not pb:
+            continue
+        st = extract_status(pb)
+        if st.run_state is not None or st.controller_mode is not None:
+            return st
+    return None
+
+
+# ── formatting ───────────────────────────────────────────────────────────────
+
+def _flags_to_slots(flags):
+    """Bitmask -> 'A', 'A+C', etc. (A=bit0)."""
+    if not flags:
+        return "-"
+    return "+".join(SLOT_LETTERS.get(b + 1, f"?{b}") for b in range(6) if flags & (1 << b))
+
+
+def _fmt_weekdays(mask):
+    if mask == 0x7F:
+        return "every day"
+    return ",".join(WEEKDAY_NAMES[b] for b in range(7) if mask & (1 << b)) or "(none)"
+
+
+def _fmt_schedule(sch):
+    """One-line human summary of a decoded ProgramSchedule."""
+    if sch.empty:
+        return "empty"
+    if sch.day_mode == "weekdays":
+        days = _fmt_weekdays(sch.weekday_mask or 0)
+    elif sch.day_mode == "interval":
+        days = f"every {sch.interval_days}d"
+        if sch.interval_anchor:
+            days += f" from {sch.interval_anchor[:10]}"
+    elif sch.day_mode in ("odd", "even", "once"):
+        days = sch.day_mode
+    else:
+        days = "?"
+    starts = ",".join(f"{m // 60:02d}:{m % 60:02d}" for m in sch.start_mins) or "-"
+    zones = ",".join(f"z{sid + 1}:{sec}s" for sid, sec in sch.zones) or "-"
+    en = "" if sch.enabled is None else (" [enabled]" if sch.enabled else " [disabled]")
+    name = f'"{sch.name}" ' if sch.name else ""
+    return f"{name}{days} @ {starts} zones {zones}{en}"
 
 
 # ─── Setup Wizard ────────────────────────────────────────────────────────
@@ -682,6 +1036,7 @@ class _RxCollector:
         run_state = is_watering = battery_mv = device_clock = None
         active_station = seconds_remaining = flow_total = None
         rd_minutes = rd_expiry = rd_active = None
+        controller_mode = next_start_flags = next_start_epoch = None
         for inner in self.decoded:
             st = extract_status(inner["protobuf"])
             run_state = st.run_state if st.run_state is not None else run_state
@@ -696,11 +1051,18 @@ class _RxCollector:
             rd_minutes = st.rain_delay_minutes if st.rain_delay_minutes is not None else rd_minutes
             rd_expiry = st.rain_delay_expiry if st.rain_delay_expiry is not None else rd_expiry
             rd_active = st.rain_delay_active if st.rain_delay_active is not None else rd_active
+            controller_mode = st.controller_mode if st.controller_mode is not None else controller_mode
+            next_start_flags = st.next_start_flags if st.next_start_flags is not None else next_start_flags
+            next_start_epoch = st.next_start_epoch if st.next_start_epoch is not None else next_start_epoch
         return DeviceStatus(
             run_state, is_watering, battery_mv, device_clock,
             active_station, seconds_remaining, flow_total,
             rd_minutes, rd_expiry, rd_active,
+            controller_mode, next_start_flags, next_start_epoch,
         )
+
+
+_MODE_NAMES = {0: "off", 1: "auto", 2: "manual"}
 
 
 def _format_status(st):
@@ -713,6 +1075,14 @@ def _format_status(st):
         parts.append(f"{st.seconds_remaining}s left")
     if st.run_state is not None:
         parts.append(f"run_state={st.run_state}")
+    if st.controller_mode is not None:         # #16.#2.#1 (0=off, 1=auto, 2=manual)
+        parts.append(f"mode={_MODE_NAMES.get(st.controller_mode, st.controller_mode)}")
+    if st.next_start_flags:                    # #16.#9/#10: next scheduled program run
+        when = ""
+        if st.next_start_epoch:
+            ns = datetime.fromtimestamp(st.next_start_epoch, tz=timezone.utc).astimezone()
+            when = f" @ {ns:%Y-%m-%d %H:%M}"
+        parts.append(f"next {_flags_to_slots(st.next_start_flags)}{when}")
     if st.battery_mv is not None:
         parts.append(f"battery {st.battery_mv} mV")
     if st.device_clock is not None:
@@ -940,6 +1310,211 @@ async def ble_rain_delay(mac, network_key, action, hours=None):
         print("Done.")
 
 
+# ─── Watering-program transport (multi-frame RX; running RX counter) ─────────
+
+class _BurstCollector:
+    """Keeps every raw RX frame and fires an event on each. Unlike _RxCollector
+    (which decodes each frame independently), program reads need the raw frames so
+    reassemble_rx can rebuild a multi-frame stream."""
+
+    def __init__(self):
+        self.raw = []
+        self.event = asyncio.Event()
+
+    def handle(self, _sender, data):
+        self.raw.append(bytes(data))
+        self.event.set()
+
+
+async def _drain_burst(collector, window, quiet=1.6):
+    """Collect frames for up to `window` s, returning `quiet` s after the last one."""
+    deadline = time.time() + window
+    last = time.time()
+    while time.time() < deadline:
+        collector.event.clear()
+        try:
+            await asyncio.wait_for(collector.event.wait(), timeout=quiet)
+            last = time.time()
+        except asyncio.TimeoutError:
+            if time.time() - last >= quiet:
+                break
+
+
+class _ProgramSession:
+    """A connected BLE session with running RX-counter tracking, so multiple
+    request/replies on ONE connection each reassemble correctly (the RX counter
+    advances by block-count across every reply). Mirrors the reference in
+    scripts/exploration/probe_programs.py; HA's connection.py mirrors this."""
+
+    def __init__(self, client, collector, key, iv, tx_ctr, rx_ctr):
+        self.client, self.collector = client, collector
+        self.key, self.iv = key, iv
+        self.tx_ctr, self.rx_ctr = tx_ctr, rx_ctr
+
+    async def send(self, protobuf):
+        msg = build_message(protobuf)
+        ct, self.tx_ctr = aes_encrypt(self.key, self.iv, self.tx_ctr, msg)
+        await self.client.write_gatt_char(
+            WRITE_CHAR, build_ble_frame(ct, compute_trailer(msg)), response=False
+        )
+
+    async def request(self, protobuf, window=4.0):
+        """Send a request, drain the reply burst, reassemble, advance rx_ctr."""
+        n0 = len(self.collector.raw)
+        self.collector.event.clear()
+        await self.send(protobuf)
+        await _drain_burst(self.collector, window)
+        new = _dedup_consecutive(self.collector.raw[n0:])
+        if not new:
+            return []
+        base, _stream, msgs = reassemble_rx(self.key, self.iv, self.rx_ctr, new)
+        self.rx_ctr = (base + _count_rx_blocks(new)) % 0x100000000
+        return msgs
+
+
+async def _open_program_session(client, key):
+    """Handshake and return a _ProgramSession armed with a raw-frame burst collector."""
+    collector = _BurstCollector()
+    await client.start_notify(READ_CHAR, collector.handle)
+    init_tx = bytearray(os.urandom(20))
+    init_tx[11] = 0x00
+    init_tx = bytes(init_tx)
+    await client.write_gatt_char(AES_CHAR, init_tx)
+    rx = await client.read_gatt_char(AES_CHAR)
+    iv, tx_ctr, rx_ctr = derive_session(init_tx, rx)
+    print("Session established")
+    return _ProgramSession(client, collector, key, iv, tx_ctr, rx_ctr)
+
+
+async def _program_set(sess, spec):
+    """Store a program and, if enabled, drive the 3-write run handshake."""
+    letter = SLOT_LETTERS.get(spec.slot, str(spec.slot))
+    programs, mask, _ = parse_sync_dump(await sess.request(build_sync_request_protobuf(), window=6.0))
+    mask = mask or 0
+
+    pb = build_program_protobuf(spec)
+    print(f"  STORE program {letter}: {pb.hex()}")
+    await sess.request(pb, window=4.0)
+
+    programs, _, _ = parse_sync_dump(await sess.request(build_sync_request_protobuf(), window=6.0))
+    if spec.slot in programs and not programs[spec.slot].empty:
+        print(f"  readback: {_fmt_schedule(programs[spec.slot])}")
+    else:
+        print(f"  ⚠ slot {letter} not found in read-back — the store may not have taken")
+
+    bit = 1 << (spec.slot - 1)
+    if not spec.enabled:
+        # Store only; clear this slot's enable bit but leave the controller in
+        # autoMode (never drop it to offMode). Other slots keep their state.
+        await sess.request(build_set_active_programs_protobuf(mask & ~bit))
+        await sess.request(build_set_timer_mode_protobuf(1))  # autoMode
+        print(f"  stored {letter} (disabled). Enable it with `program set ... --enable`.")
+        return
+
+    newmask = mask | bit
+    # The device computes a next-start only when store+enable arrive while already
+    # in autoMode, so: enable -> autoMode -> re-send store+enable, then confirm.
+    await sess.request(build_set_active_programs_protobuf(newmask))
+    await sess.request(build_set_timer_mode_protobuf(1))  # autoMode / "Enable Watering"
+    await sess.request(pb, window=4.0)
+    await sess.request(build_set_active_programs_protobuf(newmask))
+
+    conf = _first_status(await sess.request(build_request_status_protobuf(), window=5.0))
+    if conf and conf.next_start_flags:
+        when = ""
+        if conf.next_start_epoch:
+            ns = datetime.fromtimestamp(conf.next_start_epoch, tz=timezone.utc).astimezone()
+            out = (conf.next_start_epoch - conf.device_clock) if conf.device_clock else None
+            when = f" at {ns:%Y-%m-%d %H:%M}" + (f" (~{out}s out)" if out else "")
+        print(f"  ✅ enabled {letter}; next start = {_flags_to_slots(conf.next_start_flags)}{when}")
+    else:
+        print(f"  ⚠ enabled {letter} but the device did not report a next-start "
+              "(check the schedule/day-mode)")
+
+
+async def ble_program(mac, network_key, action, spec=None, slot=None):
+    from bleak import BleakClient, BleakScanner
+
+    key = bytes.fromhex(network_key)
+    print(f"Scanning for {mac}...")
+    device = await BleakScanner.find_device_by_address(mac, timeout=25.0)
+    if device is None:
+        print(f"{mac} not found — check it's powered and in BLE range "
+              "(the scan can miss it transiently; just retry).")
+        return
+    print("Found. Connecting...")
+
+    async with BleakClient(device, timeout=15.0) as client:
+        await _connect(client)
+        sess = await _open_program_session(client, key)
+        try:
+            if action in ("list", "get"):
+                msgs = await sess.request(build_sync_request_protobuf(), window=6.0)
+                programs, mask, status = parse_sync_dump(msgs)
+                if not programs:
+                    print("No programs decoded (retry; the sync burst can drop).")
+                slots = [slot] if slot else sorted(programs)
+                for sid in slots:
+                    sch = programs.get(sid)
+                    letter = SLOT_LETTERS.get(sid, str(sid))
+                    if sch is None:
+                        print(f"  {letter}: (not returned)")
+                    else:
+                        print(f"  {letter}: {_fmt_schedule(sch)}")
+                if status and status.next_start_flags:
+                    print(f"  next run: {_flags_to_slots(status.next_start_flags)}")
+
+            elif action == "delete":
+                letter = SLOT_LETTERS.get(slot, str(slot))
+                print(f"  deleting slot {letter} ...")
+                # drop its enable bit first so an enabled slot isn't left dangling
+                _, mask, _ = parse_sync_dump(await sess.request(build_sync_request_protobuf(), window=6.0))
+                await sess.request(build_set_active_programs_protobuf((mask or 0) & ~(1 << (slot - 1))))
+                await sess.request(build_program_delete_protobuf(slot))
+                await sess.request(build_set_timer_mode_protobuf(1))  # keep controller in autoMode
+                programs, _, _ = parse_sync_dump(await sess.request(build_sync_request_protobuf(), window=6.0))
+                sch = programs.get(slot)
+                if sch is None or sch.empty:
+                    print(f"  ✅ slot {letter} cleared")
+                else:
+                    print(f"  ⚠ slot {letter} still present: {_fmt_schedule(sch)}")
+
+            elif action == "set":
+                await _program_set(sess, spec)
+        finally:
+            await client.stop_notify(READ_CHAR)
+        print("Done.")
+
+
+async def ble_set_controller_mode(mac, network_key, mode):
+    """Set the device-global controller mode: 1=auto ("Enable Watering"), 0=off."""
+    from bleak import BleakClient, BleakScanner
+
+    key = bytes.fromhex(network_key)
+    name = _MODE_NAMES.get(mode, str(mode))
+    print(f"Scanning for {mac}...")
+    device = await BleakScanner.find_device_by_address(mac, timeout=25.0)
+    if device is None:
+        print(f"{mac} not found — check it's powered and in BLE range "
+              "(the scan can miss it transiently; just retry).")
+        return
+    print("Found. Connecting...")
+
+    async with BleakClient(device, timeout=15.0) as client:
+        await _connect(client)
+        sess = await _open_program_session(client, key)
+        try:
+            before = _first_status(await sess.request(build_request_status_protobuf(), window=5.0))
+            await sess.request(build_set_timer_mode_protobuf(mode))
+            after = _first_status(await sess.request(build_request_status_protobuf(), window=5.0))
+            b = _MODE_NAMES.get(before.controller_mode) if before else "?"
+            a = _MODE_NAMES.get(after.controller_mode) if after else "?"
+            print(f"Controller mode: {b} -> {a} (requested {name})")
+        finally:
+            await client.stop_notify(READ_CHAR)
+        print("Done.")
+
+
 async def ble_flow(mac, network_key, seconds=8):
     from bleak import BleakClient, BleakScanner
 
@@ -1114,6 +1689,113 @@ def cmd_rain_delay(args):
     asyncio.run(ble_rain_delay(mac, network_key, args.rd_action, args.hours))
 
 
+def _resolve_device(args):
+    """Shared (mac, network_key, name) lookup from $BHYVE_CONFIG + --device/--mac."""
+    config = load_config()
+    if not config.get("devices"):
+        print("No devices configured. Run setup first:\n  python3 bhyve.py setup")
+        sys.exit(1)
+    dev_idx = (getattr(args, "device", None) or 1) - 1
+    if dev_idx < 0 or dev_idx >= len(config["devices"]):
+        print(f"Device {dev_idx+1} not found. You have {len(config['devices'])} device(s).")
+        sys.exit(1)
+    dev = config["devices"][dev_idx]
+    return (args.mac or dev["mac"]), dev["network_key"], dev["name"]
+
+
+def _parse_slot(s):
+    s = str(s).strip().upper()
+    if s in PROGRAM_SLOTS:
+        return PROGRAM_SLOTS[s]
+    if s.isdigit() and 1 <= int(s) <= 6:
+        return int(s)
+    raise SystemExit(f"invalid slot {s!r} — use A-F (or 1-6)")
+
+
+def _parse_weekdays(s):
+    s = s.strip().lower()
+    if s in ("all", "daily", "every", "everyday"):
+        return 0x7F
+    mask = 0
+    for tok in s.split(","):
+        key = tok.strip()[:3]
+        if key not in WEEKDAY_BITS:
+            raise SystemExit(f"invalid weekday {tok!r} — use sun,mon,tue,wed,thu,fri,sat or 'all'")
+        mask |= 1 << WEEKDAY_BITS[key]
+    return mask
+
+
+def _parse_start_times(s):
+    out = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        h, _, m = tok.partition(":")
+        try:
+            out.append((int(h) * 60 + int(m or 0)) % 1440)
+        except ValueError:
+            raise SystemExit(f"invalid start time {tok!r} — use HH:MM (e.g. 06:00)")
+    return tuple(out)
+
+
+def _parse_zones(s):
+    """'1:300,2:420' -> ((0,300),(1,420)); CLI zones are 1-indexed, wire is 0-indexed."""
+    out = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        z, _, sec = tok.partition(":")
+        try:
+            out.append((int(z) - 1, int(sec)))
+        except ValueError:
+            raise SystemExit(f"invalid zone spec {tok!r} — use ZONE:SECONDS (e.g. 1:300)")
+    return tuple(out)
+
+
+def _spec_from_args(args):
+    modes = [m for m, on in (("weekdays", args.days), ("interval", args.every),
+                             ("odd", args.odd), ("even", args.even), ("once", args.once)) if on]
+    if len(modes) != 1:
+        raise SystemExit("choose exactly one day-mode: --days / --every / --odd / --even / --once")
+    day_mode = modes[0]
+    weekday_mask = _parse_weekdays(args.days) if day_mode == "weekdays" else None
+    interval_anchor = None
+    if day_mode == "interval":
+        interval_anchor = args.anchor or (
+            datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        )
+    return ProgramSpec(
+        slot=_parse_slot(args.slot),
+        day_mode=day_mode,
+        weekday_mask=weekday_mask,
+        interval_days=args.every,
+        interval_anchor=interval_anchor,
+        start_mins=_parse_start_times(args.start),
+        zones=_parse_zones(args.zones),
+        name=args.name or "",
+        budget=args.budget,
+        enabled=args.enable,
+    )
+
+
+def cmd_program(args):
+    mac, network_key, name = _resolve_device(args)
+    print(f"B-Hyve Controller — {name}")
+    if args.prog_action in (None, "list"):
+        asyncio.run(ble_program(mac, network_key, "list"))
+    elif args.prog_action == "get":
+        asyncio.run(ble_program(mac, network_key, "get", slot=_parse_slot(args.slot)))
+    elif args.prog_action == "delete":
+        asyncio.run(ble_program(mac, network_key, "delete", slot=_parse_slot(args.slot)))
+    elif args.prog_action == "set":
+        asyncio.run(ble_program(mac, network_key, "set", spec=_spec_from_args(args)))
+
+
+def cmd_mode(args):
+    mac, network_key, name = _resolve_device(args)
+    print(f"B-Hyve Controller — {name}")
+    mode = 1 if args.mode_action == "enable" else 0
+    asyncio.run(ble_set_controller_mode(mac, network_key, mode))
+
+
 # ─── CLI ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -1135,6 +1817,15 @@ Control:
   %(prog)s rain-delay get    Read the current rain delay
   %(prog)s rain-delay set 24 Delay watering for 24 hours
   %(prog)s rain-delay clear  Clear the rain delay
+
+Programs (slots A-D):
+  %(prog)s program list      List all program slots
+  %(prog)s program get A     Show slot A
+  %(prog)s program set A --days mon,wed,fri --start 06:00,18:00 --zones 1:300,2:420 --name Front --enable
+  %(prog)s program set B --every 3 --start 06:00 --zones 1:600 --name Drip
+  %(prog)s program delete A  Clear slot A
+  %(prog)s mode enable       Enable automatic watering (autoMode)
+  %(prog)s mode disable      Turn the controller off (offMode)
 
 ⚠️  Do NOT update your B-Hyve firmware — it may break this tool!
         """,
@@ -1181,6 +1872,44 @@ Control:
     rd_p.add_argument("--device", "-d", type=int, help="Device number (if multiple)")
     rd_p.add_argument("--mac", help="Override MAC address")
 
+    # Programs (slots A-D)
+    def _dev_args(p):
+        p.add_argument("--device", "-d", type=int, help="Device number (if multiple)")
+        p.add_argument("--mac", help="Override MAC address")
+
+    prog_p = sub.add_parser("program", help="Get/set/delete watering programs (slots A-D)")
+    prog_sub = prog_p.add_subparsers(dest="prog_action")
+    _dev_args(prog_p)
+    pl = prog_sub.add_parser("list", help="List all program slots")
+    _dev_args(pl)
+    pg = prog_sub.add_parser("get", help="Show one slot")
+    pg.add_argument("slot", help="Slot letter A-F")
+    _dev_args(pg)
+    pdel = prog_sub.add_parser("delete", help="Clear a slot")
+    pdel.add_argument("slot", help="Slot letter A-F")
+    _dev_args(pdel)
+    pset = prog_sub.add_parser("set", help="Create/replace a program in a slot")
+    pset.add_argument("slot", help="Slot letter A-F")
+    pset.add_argument("--days", help="weekday list, e.g. mon,wed,fri or 'all'")
+    pset.add_argument("--every", type=int, help="every N days")
+    pset.add_argument("--anchor", help="interval anchor date ISO (default: today)")
+    pset.add_argument("--odd", action="store_true", help="odd calendar days")
+    pset.add_argument("--even", action="store_true", help="even calendar days")
+    pset.add_argument("--once", action="store_true", help="one-time run (unverified on hardware)")
+    pset.add_argument("--start", required=True, help="start times HH:MM[,HH:MM]")
+    pset.add_argument("--zones", required=True, help="zone:seconds list, e.g. 1:300,2:420")
+    pset.add_argument("--name", default="", help="program name")
+    pset.add_argument("--budget", type=int, default=100, help="seasonal budget %% (default 100)")
+    pset.add_argument("--enable", action="store_true",
+                      help="enable + arm the schedule (runs the 3-write handshake)")
+    _dev_args(pset)
+
+    # Controller mode
+    mode_p = sub.add_parser("mode", help="Enable (auto) or disable (off) automatic watering")
+    mode_p.add_argument("mode_action", choices=["enable", "disable"],
+                        help="enable = autoMode ('Enable Watering'); disable = offMode")
+    _dev_args(mode_p)
+
     args = parser.parse_args()
 
     if args.action == "setup":
@@ -1194,6 +1923,10 @@ Control:
         cmd_flow(args)
     elif args.action == "rain-delay":
         cmd_rain_delay(args)
+    elif args.action == "program":
+        cmd_program(args)
+    elif args.action == "mode":
+        cmd_mode(args)
     else:
         parser.print_help()
 
