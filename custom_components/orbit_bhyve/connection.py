@@ -94,6 +94,12 @@ class BHyveBleConnection:
         self._rx_ctr: int = 0
         self._lock = asyncio.Lock()
         self._notif_buf: list[bytes] = []
+        # Decrypted plaintext of each notification in the current burst, in arrival
+        # order — parallel to _notif_buf. send_stream() concatenates these into one
+        # CTR stream so a multi-frame reply (a #19 program body that spans frames)
+        # can be reassembled. Populated in _on_notify right after a successful
+        # decrypt; cleared with _notif_buf before every write.
+        self._notif_pt: list[bytes] = []
         self._notif_event = asyncio.Event()  # set on every notification; drives _drain
         self._last_rx_frame: bytes | None = None  # last raw RX frame, for de-dup
         self._handshaken = False
@@ -225,6 +231,11 @@ class BHyveBleConnection:
                 "%s: notif pt=%s (ct=%s)",
                 self.mac, pt.hex(), frame.hex(),
             )
+            # Accumulate the decrypted plaintext for send_stream's multi-frame
+            # reassembly. Do this BEFORE the header check below returns early on a
+            # continuation frame — a long reply's continuation blocks legitimately
+            # don't carry the inner-message header but ARE part of the stream.
+            self._notif_pt.append(pt)
             if (
                 self._reply_header is not None
                 and len(pt) >= 4
@@ -277,6 +288,7 @@ class BHyveBleConnection:
         self._handshaken = False
         self._iv = None
         self._last_rx_frame = None
+        self._notif_pt.clear()
 
     def _arm_idle_timer(self) -> None:
         if self._idle_sec <= 0:
@@ -377,6 +389,7 @@ class BHyveBleConnection:
         """Write a command and collect its reply. Caller MUST hold self._lock and
         have an established, initialised session."""
         self._notif_buf.clear()
+        self._notif_pt.clear()
         await self._write_locked(plaintext)
         await self._drain(drain_ms)
         received = list(self._notif_buf)
@@ -390,6 +403,29 @@ class BHyveBleConnection:
         async with self._lock:
             await self.ensure_connected()
             return await self._write_and_drain(plaintext, drain_ms)
+
+    async def send_stream(self, plaintext: bytes, *, drain_ms: int = 4000) -> bytes:
+        """Send a request and return the concatenated decrypted plaintext of the
+        WHOLE reply burst, for multi-frame reassembly by the caller.
+
+        A long inner message (a #19 program body in a #10 sync dump) streams as
+        consecutive 16-byte CTR blocks, each in its own outer frame, the RX counter
+        advancing per block across all of them. _on_notify decrypts each frame at
+        the running counter, so joining the per-frame plaintexts reproduces the
+        original stream; the caller (status.split_inner_messages / parse_sync_dump)
+        scans it for the aa775a0f-headed inner messages. Single-frame fast paths
+        (#16/#30/#59) are untouched — they still flow through send()/the observer."""
+        async with self._lock:
+            await self.ensure_connected()
+            self._notif_buf.clear()
+            self._notif_pt.clear()
+            await self._write_locked(plaintext)
+            await self._drain(drain_ms)
+            stream = b"".join(self._notif_pt)
+            self._notif_buf.clear()
+            self._notif_pt.clear()
+            self._arm_idle_timer()
+            return stream
 
     async def send_raw(self, plaintext: bytes) -> None:
         """Encrypt + WRITE_REQ with no notification drain. For init-step
