@@ -17,7 +17,7 @@ import pytest
 from orbit_bhyve.connection import BHyveBleConnection
 from orbit_bhyve.devices import protobuf as tx
 from orbit_bhyve.devices import status as rx
-from orbit_bhyve.devices.base import DeviceState, ProgramSpec
+from orbit_bhyve.devices.base import DeviceState, ProgramSpec, ProgramSummary
 from orbit_bhyve.devices.ht25g2 import BHyveHT25G2Device
 
 # The CLI is the source-of-truth encode/decode contract; import it for parity.
@@ -427,6 +427,67 @@ def _status_idle() -> bytes:
     return tx._build_message(
         tx._pb_field_bytes(rx.RX_F_STATUS, tx._pb_field_varint(rx.RX_F_STATUS_MODE, 1))
     )
+
+
+class _ScriptedStreamConn:
+    """Returns a scripted list of sync-dump streams, one per send_stream call (so a
+    retry consumes the next). Feeds a canned status on a #15/#75 elicitor."""
+
+    def __init__(self, device, streams, status_pt=None):
+        self.device = device
+        self._streams = list(streams)
+        self.status_pt = status_pt
+        self.sent: list[bytes] = []
+        self.streamed: list[bytes] = []
+        self.disconnects = 0
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        self.sent.append(frame)
+        if _is_status_elicitor(frame) and self.status_pt is not None:
+            self.device._observe_plaintext(self.status_pt)
+        return [b"\x01"]
+
+    async def send_stream(self, frame: bytes, drain_ms: int = 4000):
+        self.streamed.append(frame)
+        return self._streams.pop(0) if self._streams else b""
+
+    async def disconnect(self):
+        self.disconnects += 1
+
+    @property
+    def is_connected(self):
+        return True
+
+
+def test_read_programs_retries_on_partial_then_succeeds():
+    # A marginal-link read that returns a truncated stream (no #20 mask decoded)
+    # must retry once on a fresh handshake and take the good read.
+    a = tx._build_program_pb(_ha_spec(1, "odd", start_mins=(360,), zones=((0, 60),), name="A"))
+    dev = _make_gen2()
+    dev.connection = _ScriptedStreamConn(dev, streams=[b"", _dump_stream([a], mask=1)])
+    programs = asyncio.run(dev.get_programs())
+    assert 1 in programs and programs[1].enabled is True
+    assert len(dev.connection.streamed) == 2   # retried once
+
+
+def test_read_programs_falls_back_to_last_known_on_double_miss():
+    # Two partial reads in a row must NOT blank the known schedules — get_programs
+    # returns the last-known state.programs, not empty.
+    dev = _make_gen2()
+    dev.state.programs = {1: ProgramSummary(slot=1, empty=False, enabled=True, name="Keep")}
+    dev.connection = _ScriptedStreamConn(dev, streams=[b"", b""])
+    programs = asyncio.run(dev.get_programs())
+    assert 1 in programs and programs[1].name == "Keep"
+
+
+def test_read_programs_empty_device_completes_without_retry():
+    # A genuinely empty device returns the #20 mask (0) with no #19 bodies — that is
+    # a COMPLETE read, not a partial one, so it must not retry.
+    dev = _make_gen2()
+    dev.connection = _ScriptedStreamConn(dev, streams=[_dump_stream([], mask=0)])
+    programs = asyncio.run(dev.get_programs())
+    assert programs == {}
+    assert len(dev.connection.streamed) == 1   # no retry
 
 
 def test_refresh_state_reads_programs_on_idle_poll():

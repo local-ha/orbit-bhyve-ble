@@ -609,27 +609,50 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
 
     async def _read_programs(self) -> tuple[dict, int | None]:
         """Read every program slot in one shot via #10 syncRequest, reassembled
-        across the multi-frame RX burst. Updates self.state.programs and returns
+        across the multi-frame RX burst, and update self.state.programs. Returns
         (programs {slot:ProgramSummary}, active_mask). The #16 status in the dump
         is applied to state by the per-frame observer; parse_sync_dump here pulls
-        the multi-frame #19 program bodies + the #20 enable bitmask."""
-        stream = await self.connection.send_stream(
-            _build_message(_build_sync_request_pb()), drain_ms=6000
-        )
-        programs, mask, _status = parse_sync_dump(stream)
-        if programs:
-            self.state.programs = programs
-        return programs, mask
+        the multi-frame #19 program bodies + the #20 enable bitmask.
+
+        A read is COMPLETE only when the #20 mask decodes (mask is not None): it
+        trails the #19 bodies in the stream, so its presence means the multi-frame
+        reassembly wasn't truncated by a mid-read CTR desync (the header self-heal
+        disconnects on a bad first frame — HW-seen on a marginal-link valve) or a
+        dropped tail frame. A partial read (mask=None, possibly empty or with
+        unknown enabled state) retries ONCE on a fresh handshake, then falls back to
+        the last-known state.programs rather than blanking / de-enabling known
+        schedules. An empty device legitimately returns (mask, programs={})."""
+        mask: int | None = None
+        for attempt in range(2):
+            try:
+                stream = await self.connection.send_stream(
+                    _build_message(_build_sync_request_pb()), drain_ms=6000
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("%s: program sync read failed: %s", self.mac, err)
+                stream = b""
+            programs, mask, _status = parse_sync_dump(stream)
+            if mask is not None:
+                if programs:
+                    self.state.programs = programs
+                return programs, mask
+            if attempt == 0:
+                # A desync self-heal may already be disconnecting; force a clean
+                # fresh handshake so the retry re-bases the RX counter.
+                await self.connection.disconnect()
+        return self.state.programs, mask
 
     async def get_programs(self) -> dict:
         """Public read: connect, dump all slots, disconnect. Returns
-        {slot(1-6): ProgramSummary} (also stored on self.state.programs)."""
+        {slot(1-6): ProgramSummary} — the freshly-read schedules, or the last-known
+        state.programs if this read came back partial, so a marginal-link miss never
+        returns empty or de-enabled."""
         async with self._api_lock:
             if self.connection is None:
                 return {}
             try:
-                programs, _mask = await self._read_programs()
-                return programs
+                await self._read_programs()
+                return dict(self.state.programs)
             finally:
                 await self.connection.disconnect()
 
