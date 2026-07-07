@@ -229,6 +229,20 @@ def build_request_status_protobuf():
     return pb_field_bytes(15, b"")
 
 
+def build_set_clock_protobuf(when=None):
+    """Clock-sync: #18 { #1 = 'YYYY-MM-DDThh:mm:ss±hh:mm' } (ISO-8601 LOCAL time).
+
+    The vendor app sends this on every connect; we never did, so a device that
+    hasn't talked to the app drifts (observed ~20 h off on BTValve03). Defaults
+    to the host's current local time. The device stores it as its wall clock, and
+    program start-times (#8), rain-delay expiry (#3), and the auto-close all key
+    off that clock — so a correct clock is what makes a scheduled program fire at
+    the intended real-world time.
+    """
+    when = when or datetime.now().astimezone()
+    return pb_field_bytes(18, pb_field_bytes(1, when.isoformat(timespec="seconds").encode()))
+
+
 def build_flow_subscribe_protobuf(interval_ms=1000):
     """Flow subscribe: #57 { #1=intervalMs; #2=2 }. The device then streams periodic
     #59 FlowSensorData frames. On fw0111 these carry only three varints:
@@ -1116,6 +1130,18 @@ def _format_rain_delay(st):
     return ", ".join(parts)
 
 
+def _format_clock(dev_clock, label="device clock"):
+    """Show the device's wall clock (#7) as local time + its skew vs the host."""
+    if dev_clock is None:
+        return f"{label}: unknown (no #16 decoded)"
+    dev = datetime.fromtimestamp(dev_clock, tz=timezone.utc).astimezone()
+    host = datetime.now().astimezone()
+    skew = dev_clock - int(host.timestamp())
+    hrs = skew / 3600
+    tail = f"{skew:+d}s" if abs(skew) < 600 else f"{skew:+d}s = {hrs:+.2f}h"
+    return f"{label}: {dev:%Y-%m-%d %H:%M:%S %z}  (host {host:%H:%M:%S}; skew {tail})"
+
+
 async def _await_rx(collector, first_timeout, drain=1.5):
     """Wait (bounded) for the first decoded RX frame, then drain the burst briefly.
 
@@ -1317,6 +1343,77 @@ async def ble_rain_delay(mac, network_key, action, hours=None):
             print(f"Device responded ({len(collector.raw)} notification(s)) but none decoded.")
         else:
             print("No confirmation notification received.")
+        await client.stop_notify(READ_CHAR)
+        print("Done.")
+
+
+async def ble_clock(mac, network_key, action):
+    """Read (`get`) or set (`sync`) the device's wall clock (#18/#7)."""
+    from bleak import BleakClient, BleakScanner
+
+    key = bytes.fromhex(network_key)
+    print(f"Scanning for {mac}...")
+    device = await BleakScanner.find_device_by_address(mac, timeout=25.0)
+    if device is None:
+        print(f"{mac} not found — check it's powered and in BLE range "
+              "(the scan can miss it transiently; just retry).")
+        return
+    print("Found. Connecting...")
+
+    async with BleakClient(device, timeout=15.0) as client:
+        await _connect(client)
+        collector = _RxCollector()
+        iv, counter = await _init_session(client, key, collector)
+
+        async def send_pb(protobuf):
+            nonlocal counter
+            msg = build_message(protobuf)
+            ct, counter = aes_encrypt(key, iv, counter, msg)
+            await client.write_gatt_char(
+                WRITE_CHAR, build_ble_frame(ct, compute_trailer(msg)), response=False
+            )
+
+        # Read the current device clock (#15{} -> #16 carries #7).
+        await send_pb(build_request_status_protobuf())
+        await _await_rx(collector, first_timeout=6.0)
+        before = collector.merged_status().device_clock
+        print(_format_clock(before, "Before"))
+        host_before = int(datetime.now().astimezone().timestamp())
+
+        if action == "get":
+            await client.stop_notify(READ_CHAR)
+            return
+
+        # Send the app's #18 setDateTime (best-effort). NOTE: hardware-verified
+        # 2026-07-06 that both fw0107 (XD) and fw0111 (Gen2) IGNORE this over BLE
+        # — the device clock is cloud/hub-managed, not locally settable. We still
+        # send it (harmless, byte-identical to the app; some firmware may honor
+        # it) and then verify whether it actually took.
+        now = datetime.now().astimezone()
+        collector.decoded.clear()
+        collector.event.clear()
+        await send_pb(build_set_clock_protobuf(now))
+        print(f"Clock sync -> {now:%Y-%m-%d %H:%M:%S %z} — sent!")
+        await _await_rx(collector, first_timeout=4.0)
+        collector.decoded.clear()
+        collector.event.clear()
+        await send_pb(build_request_status_protobuf())
+        await _await_rx(collector, first_timeout=6.0)
+        after = collector.merged_status().device_clock
+        print(_format_clock(after, "After"))
+        # Verdict: did the skew actually collapse? (Account for the ~seconds that
+        # elapsed between reads.) If the offset barely moved, the device ignored it.
+        if before is not None and after is not None:
+            skew_before = before - host_before
+            skew_after = after - int(datetime.now().astimezone().timestamp())
+            if abs(skew_after) <= 5:
+                print("Result: clock is now in sync.")
+            elif abs(skew_after - skew_before) <= 5:
+                print("Result: device IGNORED the clock-set (offset unchanged). On this "
+                      "firmware the clock is cloud/hub-managed and not settable over BLE.")
+            else:
+                print(f"Result: offset changed {skew_before:+d}s -> {skew_after:+d}s "
+                      "(partial/unexpected).")
         await client.stop_notify(READ_CHAR)
         print("Done.")
 
@@ -1807,6 +1904,12 @@ def cmd_mode(args):
     asyncio.run(ble_set_controller_mode(mac, network_key, mode))
 
 
+def cmd_clock(args):
+    mac, network_key, name = _resolve_device(args)
+    print(f"B-Hyve Controller — {name}")
+    asyncio.run(ble_clock(mac, network_key, args.clock_action))
+
+
 # ─── CLI ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -1837,6 +1940,8 @@ Programs (slots A-D):
   %(prog)s program delete A  Clear slot A
   %(prog)s mode enable       Enable automatic watering (autoMode)
   %(prog)s mode disable      Turn the controller off (offMode)
+  %(prog)s clock get         Show the device clock + skew vs host
+  %(prog)s clock sync        Set the device clock to host-local now
 
 ⚠️  Do NOT update your B-Hyve firmware — it may break this tool!
         """,
@@ -1921,6 +2026,12 @@ Programs (slots A-D):
                         help="enable = autoMode ('Enable Watering'); disable = offMode")
     _dev_args(mode_p)
 
+    # Clock sync
+    clock_p = sub.add_parser("clock", help="Read (get) or set (sync) the device wall clock")
+    clock_p.add_argument("clock_action", choices=["get", "sync"],
+                         help="get = show device clock + skew; sync = set it to host-local now")
+    _dev_args(clock_p)
+
     args = parser.parse_args()
 
     if args.action == "setup":
@@ -1938,6 +2049,8 @@ Programs (slots A-D):
         cmd_program(args)
     elif args.action == "mode":
         cmd_mode(args)
+    elif args.action == "clock":
+        cmd_clock(args)
     else:
         parser.print_help()
 

@@ -171,6 +171,18 @@ def test_dedup_consecutive_drops_repeat_frame():
     assert B._dedup_consecutive(frames) == [b"\x11\x02\xaa\xbb", b"\x11\x02\xcc\xdd"]
 
 
+# --- clock sync (#18) -------------------------------------------------------
+
+def test_set_clock_builds_iso_local_string():
+    from datetime import datetime, timezone, timedelta
+
+    when = datetime(2026, 7, 6, 21, 45, 30, tzinfo=timezone(timedelta(hours=-4)))
+    pb = B.build_set_clock_protobuf(when)
+    assert pb[:2].hex() == "9201"  # field 18, wire 2
+    inner = B.pb_parse(B._pb_field(B.pb_parse(pb), 18))
+    assert B._pb_field(inner, 1).decode() == "2026-07-06T21:45:30-04:00"
+
+
 # --- sync-dump parsing ------------------------------------------------------
 
 def test_parse_sync_dump_fills_enabled_from_bitmask():

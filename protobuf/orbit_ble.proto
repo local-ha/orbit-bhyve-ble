@@ -146,7 +146,12 @@ message SetRainDelay {
   optional uint32 delayType     = 4;  // enum (observed = 1); NOT an on/off flag. May be absent on a bare clear.
 }
 
-message SetClock { optional string localIso8601 = 1; }  // "YYYY-MM-DDThh:mm:ss±hh:mm"
+// #18 setDateTime (knobunc OrbitPbApi_SetDateTime). The app sends this on connect,
+// but HW-verified 2026-07-06 that BOTH fw0107 (XD) and fw0111 (Gen2) IGNORE it over
+// BLE (a +1h set left the clock unchanged; no reply frame) — the device wall clock
+// (#7, read-only) is cloud/hub-managed and not locally settable. Kept for parity /
+// in case other firmware honors it.
+message SetClock { optional string localIso8601 = 1; }  // #1 currentTimeIso8601, "YYYY-MM-DDThh:mm:ss±hh:mm"
 
 message DeviceStatus {
   optional uint32       mode       = 1;   // 1=idle, 3=rain-delay, 4=running (manual OR program)
