@@ -446,26 +446,33 @@ class BHyveBleConnection:
         async with self._lock:
             if self.is_connected and self._handshaken:
                 # Pooled connection — refresh the (possibly stale) bind in place.
-                # Over an ESPHome BLE proxy the link can be dead at the GATT layer
-                # while HA still believes the session is pooled/up, so the in-place
-                # bind-refresh or write raises BleakError("Not connected"). Drop the
-                # stale session and retry once on a fresh handshake rather than
-                # surfacing the error to the service call. (The mesh path has no
-                # equivalent self-retry — it relies on this.)
+                # But over an ESPHome proxy the pooled link can already be dead at
+                # the GATT layer while is_connected still reads True, so the refresh
+                # writes fail with BleakError ("Not connected"). Don't let that
+                # surface as a failed actuation: drop the stale session and reopen
+                # a fresh one (ensure_connected re-runs the hook). HW-observed on a
+                # mesh HT25 STOP over a proxy — the very next fresh connect landed.
                 try:
                     if self._post_handshake_hook is not None:
                         await self._post_handshake_hook(self)
-                    return await self._write_and_drain(plaintext, drain_ms)
-                except (BleakError, asyncio.TimeoutError) as err:
+                except (BleakError, OSError, asyncio.TimeoutError) as err:
                     _LOGGER.debug(
-                        "%s: pooled actuation failed (%s) — reconnecting for a fresh session",
+                        "%s: pooled bind refresh failed (%s) — reopening a fresh session",
                         self.mac, err,
                     )
                     await self.disconnect()
-            # Cold, or the pooled refresh above failed — ensure_connected() retries
-            # the open and runs the post-handshake hook on a fresh session.
-            await self.ensure_connected()
-            return await self._write_and_drain(plaintext, drain_ms)
+                    await self.ensure_connected()
+            else:
+                # Cold — ensure_connected() retries the open and runs the hook.
+                await self.ensure_connected()
+            self._notif_buf.clear()
+            self._notif_pt.clear()
+            await self._write_locked(plaintext)
+            await self._drain(drain_ms)
+            received = list(self._notif_buf)
+            self._notif_buf.clear()
+            self._arm_idle_timer()
+            return received
 
 
 class BleNotConnectable(Exception):

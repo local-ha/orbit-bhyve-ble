@@ -14,6 +14,8 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
+from bleak.exc import BleakError
+
 from ..connection import BHyveBleConnection
 from .base import BHyveBleDeviceBase
 
@@ -199,6 +201,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             _LOGGER.debug("%s: START tx pt=%s", self.mac, plaintext.hex())
             notifs = await self._send_command(plaintext, "START")
             self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
+            self._mark_reached()  # connected + sent → device reached this cycle
             # The off-timer is armed by the device's START-ack (_observe_plaintext),
             # not by send()'s return — so this holds even when the write-response
             # times out. Report whatever state the ack has produced by now.
@@ -215,6 +218,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             _LOGGER.debug("%s: STOP tx pt=%s", self.mac, plaintext.hex())
             notifs = await self._send_command(plaintext, "STOP")
             self._stamp_command("stop", len(notifs))
+            self._mark_reached()  # connected + sent → device reached this cycle
             return not self.state.is_watering
         finally:
             if self.connection is not None:
@@ -240,12 +244,33 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         return notifs
 
     async def refresh_state(self):
-        """Best-effort liveness refresh: update is_connected from the pooled
-        connection without opening one. is_watering is driven by the device's
-        START/STOP ack (_observe_plaintext) and the coordinator's wall-clock
-        auto-close; the STATUS reply's mode byte is decoded too (base
-        _observe_plaintext, 0x04=watering/0x01=idle), but an idle poll doesn't
-        connect to elicit it, so live idle-poll status would need a connect +
-        STATUS query (future enhancement, needs hardware verification)."""
+        """Passive poll: return the last-known state without opening BLE.
+        Connectivity is event-driven (stamped by _mark_reached on each actual
+        connect: Sync / start / stop), so this poll deliberately does NOT touch
+        state.is_connected — reading the torn-down live socket would pin the
+        Connected sensor off. is_watering is driven by the device's START/STOP
+        ack (_observe_plaintext) and the coordinator's wall-clock auto-close;
+        eliciting live idle status would need a connect + STATUS query (future
+        enhancement, needs hardware verification)."""
         await super().refresh_state()
         return self.state
+
+    async def async_manual_sync(self) -> None:
+        """Sync button: this mesh class's periodic refresh_state is passive (it
+        never opens BLE), so force a fresh connect here. The connect-time 8-step
+        init's status (seq 0x02) and info (seq 0x03) replies refresh watering
+        state and battery via _observe_plaintext — the on-demand refresh #24
+        dropped when it stopped forcing a connect on the button. Ephemeral:
+        disconnect afterwards so we don't hold the device's single session."""
+        if self.connection is None:
+            return
+        try:
+            await self.connection.disconnect()
+            await self.connection.ensure_connected()
+        except (BleakError, asyncio.TimeoutError, OSError) as err:
+            _LOGGER.warning("%s: manual sync connect failed: %s", self.mac, err)
+            self._mark_unreachable()
+        else:
+            self._mark_reached()  # connect + init succeeded → device reached
+        finally:
+            await self.connection.disconnect()

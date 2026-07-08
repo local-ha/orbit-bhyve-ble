@@ -42,7 +42,7 @@ protocol for scripting and diagnostics.
 | Hose-tap timer (Gen2) | `HT25G2-0001`  | `0111`          | ✅ Full stack, hardware-verified (protobuf protocol) |
 | 4-port XD             | `HT34A-0001`   | `0107`          | ✅ Full stack, hardware-verified (protobuf protocol) |
 | 4-port XD             | `HT34-0001`    | `0058`          | ⚠️ Shares the XD protobuf protocol; not tested here |
-| 2-port XD             | `HT32A-0001`   | `0107`          | ⚠️ Shares the HT34A XD protobuf protocol; not tested here |
+| 2-port XD             | `HT32A-0001`   | `0107`          | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
 
 > ⚠️ **Do NOT update your B-Hyve device firmware.** This integration was
 > reverse-engineered against the firmware versions above. A firmware update may

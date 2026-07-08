@@ -765,3 +765,172 @@ def test_ensure_connected_does_not_multiply_retries(monkeypatch):
         asyncio.run(conn.ensure_connected())
 
     assert calls["connect"] == OPEN_MAX_ATTEMPTS  # 3, never 9
+
+
+# --- stale pooled session self-heals on actuation (connection.py) ----------
+
+def test_send_actuation_reopens_when_pooled_bind_refresh_fails():
+    # Regression (ljmerza PR #24 hardware feedback): over an ESPHome proxy a
+    # pooled session can be dead at the GATT layer while is_connected still reads
+    # True. send_actuation's in-place bind refresh then fails with BleakError
+    # ("Not connected") — which must NOT propagate to the caller (it surfaced as
+    # a failed close_valve service call in HA). Instead send_actuation drops the
+    # stale session and reopens a fresh one, then completes the command write.
+    from bleak.exc import BleakError
+
+    conn = _make_conn()
+    conn._handshaken = True
+
+    class _StaleClient:
+        is_connected = True  # is_connected property → True → pooled-refresh branch
+
+        async def disconnect(self):
+            pass
+
+    conn._client = _StaleClient()
+
+    calls = {"hook": 0, "disconnect": 0, "ensure_connected": 0, "writes": []}
+
+    async def _hook(_c):
+        calls["hook"] += 1
+        if calls["hook"] == 1:
+            # Stale pooled link: the first bind-refresh write fails at the proxy.
+            raise BleakError("Bluetooth GATT Error ... Not connected")
+
+    async def _disconnect():
+        calls["disconnect"] += 1
+
+    async def _ensure_connected():
+        calls["ensure_connected"] += 1
+
+    async def _write_locked(pt):
+        calls["writes"].append(pt)
+
+    async def _drain(_ms):
+        pass
+
+    conn.set_post_handshake_hook(_hook)
+    conn.disconnect = _disconnect
+    conn.ensure_connected = _ensure_connected
+    conn._write_locked = _write_locked
+    conn._drain = _drain
+    conn._arm_idle_timer = lambda: None
+
+    # Must not raise, even though the pooled bind refresh failed.
+    result = asyncio.run(conn.send_actuation(b"\xaa\xbb", drain_ms=1))
+
+    assert calls["disconnect"] == 1          # stale session dropped
+    assert calls["ensure_connected"] == 1    # fresh session reopened
+    assert calls["writes"] == [b"\xaa\xbb"]  # command still written after recovery
+    assert result == []
+
+
+# --- Sync button forces a connect on mesh (regression) ---------------------
+
+class _SyncConn:
+    """Minimal connection that counts connects/disconnects for the Sync test."""
+
+    def __init__(self):
+        self.ensure_connected_calls = 0
+        self.disconnects = 0
+        self._connected = False
+
+    async def ensure_connected(self):
+        self.ensure_connected_calls += 1
+        self._connected = True
+
+    async def disconnect(self):
+        self.disconnects += 1
+        self._connected = False
+
+    @property
+    def is_connected(self):
+        return self._connected
+
+
+def test_sync_button_forces_connect_on_mesh():
+    # Regression (ljmerza PR #24 feedback): #24 dropped the forced connect from
+    # the Sync button and routed it through refresh_state, which on mesh is
+    # passive (no BLE) — so the button became a no-op there (never refreshed
+    # battery/state). async_manual_sync must force a fresh connect (the 8-step
+    # init that refreshes battery/state via _observe_plaintext) and tear it down.
+    dev = object.__new__(BHyveHT25Device)  # bypass HA-heavy __init__
+    dev.mac = "44:67:55:52:94:A1"
+    dev.state = DeviceState()
+    conn = _SyncConn()
+    dev.connection = conn
+    asyncio.run(dev.async_manual_sync())
+    assert conn.ensure_connected_calls == 1   # forced a fresh connect
+    assert conn.disconnects >= 1              # torn down afterwards (ephemeral)
+
+
+def test_manual_sync_is_noop_for_protobuf():
+    # Protobuf refresh_state connects on its own (#15 read), so the base hook
+    # must NOT add a second connect on the Sync button.
+    dev = _make_device(is_watering=False)
+    conn = _SyncConn()
+    dev.connection = conn
+    asyncio.run(dev.async_manual_sync())
+    assert conn.ensure_connected_calls == 0
+
+
+# --- event-driven mesh connectivity (Connected sensor) ---------------------
+
+def test_manual_sync_marks_connected_on_success():
+    # A Sync that reaches the device must flip the Connected diagnostic on and
+    # stamp last_successful_poll / clear consecutive_timeouts. Event-driven,
+    # because the ephemeral disconnect closes the socket before the coordinator
+    # refresh runs — reading the live socket then would read False.
+    dev = object.__new__(BHyveHT25Device)
+    dev.mac = "44:67:55:52:94:A1"
+    dev.state = DeviceState(consecutive_timeouts=3)
+    dev.connection = _SyncConn()
+    asyncio.run(dev.async_manual_sync())
+    assert dev.state.is_connected is True
+    assert dev.state.consecutive_timeouts == 0
+    assert dev.state.last_successful_poll is not None
+
+
+class _FailSyncConn:
+    """A connection whose connect always fails (device unreachable)."""
+
+    async def disconnect(self):
+        pass
+
+    async def ensure_connected(self):
+        from bleak.exc import BleakError
+        raise BleakError("Not connected")
+
+    @property
+    def is_connected(self):
+        return False
+
+
+def test_manual_sync_marks_unreachable_on_failure():
+    # A Sync that can't reach the device flips Connected off and counts a timeout
+    # (and must not raise — the button/service call stays healthy).
+    dev = object.__new__(BHyveHT25Device)
+    dev.mac = "44:67:55:52:94:A1"
+    dev.state = DeviceState(is_connected=True, consecutive_timeouts=0)
+    dev.connection = _FailSyncConn()
+    asyncio.run(dev.async_manual_sync())
+    assert dev.state.is_connected is False
+    assert dev.state.consecutive_timeouts == 1
+
+
+def test_mesh_passive_poll_does_not_clobber_connected():
+    # The passive mesh poll must NOT overwrite event-driven connectivity with the
+    # torn-down live socket (which reads False under the ephemeral model) — doing
+    # so pinned the Connected sensor off right after a successful reach.
+    dev = object.__new__(BHyveHT25Device)
+    dev.mac = "44:67:55:52:94:A1"
+    dev.state = DeviceState(is_connected=True)
+
+    class _DownConn:
+        @property
+        def is_connected(self):
+            return False   # socket torn down between operations
+
+    dev.connection = _DownConn()
+    asyncio.run(dev.refresh_state())
+    assert dev.state.is_connected is True   # not clobbered
