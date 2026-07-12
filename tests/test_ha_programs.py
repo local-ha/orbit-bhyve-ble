@@ -1,10 +1,10 @@
-"""Watering-program protocol tests for the HA integration (Workstream 3).
+"""Watering-program protocol tests for the HA integration.
 
-Mirrors the CLI reference tests (`tests/test_cli_programs.py`): the HA builders
-(`devices/protobuf.py`), the multi-frame RX reassembly (`connection.send_stream`
-+ `status.split_inner_messages`/`parse_sync_dump`), and the program device methods
-must all match the CLI byte-for-byte and drive the verified 3-write handshake.
-No hardware or Home Assistant required.
+Covers the program builders (`devices/protobuf.py`) against hardware-verified
+byte references, the multi-frame RX reassembly (`connection.send_stream` +
+`status.split_inner_messages`/`parse_sync_dump`), and the program device
+methods that drive the verified 3-write enable handshake. No hardware or Home
+Assistant required.
 """
 from __future__ import annotations
 
@@ -13,14 +13,21 @@ import sys
 from pathlib import Path
 
 import pytest
+from bleak.exc import BleakError
 
 from orbit_bhyve.connection import BHyveBleConnection
 from orbit_bhyve.devices import protobuf as tx
 from orbit_bhyve.devices import status as rx
-from orbit_bhyve.devices.base import DeviceState, ProgramSpec, ProgramSummary
+from orbit_bhyve.devices.base import (
+    DeviceState,
+    ProgramSpec,
+    ProgramSummary,
+    parse_start_minutes,
+)
 from orbit_bhyve.devices.ht25g2 import BHyveHT25G2Device
 
-# The CLI is the source-of-truth encode/decode contract; import it for parity.
+# The CLI (integration branch only) is the source-of-truth encode/decode contract;
+# import it for the CLI <-> HA byte-parity tests below.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import bhyve as B  # noqa: E402
 
@@ -57,14 +64,16 @@ def test_ha_active_programs_bitmask_is_one_shifted():
         assert rx._pb_field(rx.pb_parse(body), 1) == bit
 
 
-# --- CLI <-> HA byte parity (the shipping contract) -------------------------
-
-def _cli_spec(**kw):
-    return B.ProgramSpec(**kw)
-
+# --- signed-tz epoch time (#75), hardware-verified byte reference -----------
 
 def _ha_spec(*a, **kw):
     return ProgramSpec(*a, **kw)
+
+
+# --- CLI <-> HA byte parity (the shipping contract; CLI on integration only) -
+
+def _cli_spec(**kw):
+    return B.ProgramSpec(**kw)
 
 
 @pytest.mark.parametrize("mode", [0, 1, 2])
@@ -104,6 +113,15 @@ def test_parity_set_epoch_time_signed_tz():
 )
 def test_parity_program_body(kw):
     assert tx._build_program_pb(_ha_spec(**kw)) == B.build_program_protobuf(_cli_spec(**kw))
+
+
+def test_set_epoch_time_signed_tz_byte_ref():
+    # #75 setEpochTime { #1 epoch, #2 tzOffsetSec } — the coordinator poll's
+    # elicitor. A negative tz offset must encode as a signed varint (EDT = -4h).
+    assert (
+        tx._build_set_epoch_time_pb(epoch_utc=1783317742, tz_offset_sec=-14400).hex()
+        == "da041108ee89add20610c08fffffffffffffff01"
+    )
 
 
 # --- #19 build -> parse round-trips (HA decoder) ----------------------------
@@ -160,9 +178,11 @@ def test_ha_parse_decodes_packed_single_start_hw_shape():
 
 def _dump_stream(program_pbs, mask, status_pb=None) -> bytes:
     """A #10 sync-dump plaintext stream: concatenated inner messages (each
-    aa775a0f-framed), exactly what connection.send_stream returns."""
+    aa775a0f-framed), exactly what connection.send_stream returns. mask=None
+    models a burst whose trailing #20 enable frame dropped (parse -> mask None)."""
     parts = [tx._build_message(p) for p in program_pbs]
-    parts.append(tx._build_message(tx._build_set_active_programs_pb(mask)))
+    if mask is not None:
+        parts.append(tx._build_message(tx._build_set_active_programs_pb(mask)))
     if status_pb is not None:
         parts.append(tx._build_message(status_pb))
     return b"".join(parts)
@@ -382,6 +402,88 @@ def test_delete_program_clears_slot():
     assert ops == [20, 19, 14]  # clear-bit, delete body, keep autoMode
 
 
+def test_enable_mask_reconstructs_from_state_when_frame_dropped():
+    # C1: if the #20 mask frame drops on the pre-write read (mask=None), rebuild
+    # it from the last-known per-slot enabled flags rather than collapsing to 0
+    # (which would clear every other slot's enable bit on the next write).
+    dev = _make_gen2()
+    dev.state.programs = {
+        1: ProgramSummary(slot=1, empty=False, enabled=True),
+        2: ProgramSummary(slot=2, empty=False, enabled=False),
+        3: ProgramSummary(slot=3, empty=False, enabled=True),
+    }
+    assert dev._enable_mask(None) == 0b101   # bits for slots 1 and 3
+    assert dev._enable_mask(0b010) == 0b010  # a present mask passes through
+
+
+def test_enable_preserves_other_slots_when_mask_frame_drops():
+    # C1 end-to-end: enabling slot D on a read that dropped its #20 frame must
+    # not clear slot A's enable bit — the #20 write carries A's bit too.
+    a = tx._build_program_pb(_ha_spec(1, "odd", start_mins=(360,), zones=((0, 60),), name="A"))
+    d = tx._build_program_pb(_ha_spec(4, "weekdays", weekday_mask=0x7F,
+                                      start_mins=(360,), zones=((0, 180),), name="D"))
+    dev = _make_gen2()
+    dev.state.programs = {1: ProgramSummary(slot=1, empty=False, enabled=True)}  # A known-enabled
+    dev.connection = _FakeProgramConn(
+        dev,
+        dumps=[_dump_stream([a, d], mask=None), _dump_stream([a, d], mask=0b1001)],
+    )
+    asyncio.run(dev.set_program_enabled(4, True))
+    enable_masks = [
+        rx._pb_field(rx.pb_parse(rx._pb_field(rx.pb_parse(rx.decode_inner(f)), 20)), 1)
+        for f in dev.connection.sent
+        if rx._pb_field(rx.pb_parse(rx.decode_inner(f) or b""), 20) is not None
+    ]
+    assert enable_masks and all(m & 0b0001 for m in enable_masks)  # slot A never cleared
+    assert all(m & 0b1000 for m in enable_masks)                   # slot D set
+
+
+def test_set_program_enable_confirm_requires_this_slots_next_start():
+    # C2: next_start_flags is a bitmask of whichever slot(s) start next. Enabling
+    # slot D must NOT confirm just because another program (slot A) is next.
+    spec = _ha_spec(4, "weekdays", weekday_mask=0x7F, start_mins=(360,),
+                    zones=((0, 180),), name="D", enabled=True)
+    stored = tx._build_program_pb(spec)
+    dev = _make_gen2()
+    dev.connection = _FakeProgramConn(
+        dev,
+        dumps=[_dump_stream([], mask=0), _dump_stream([stored], mask=0)],
+        status_pt=_status_with_next_start(0b0001),  # slot A is next, not D
+    )
+    assert asyncio.run(dev.set_program(spec)) is False
+
+
+class _WriteDesyncConn(_FakeProgramConn):
+    """Reads (send_stream) succeed, but the first write send() raises BleakError —
+    as a CTR-desync self-heal tears the pooled session down mid-sequence over an
+    ESPHome proxy (hardware-observed on a marginal-link Gen2 valve)."""
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        raise BleakError("Not connected")
+
+
+def test_set_program_returns_false_on_marginal_link_desync():
+    # A write that desyncs mid-sequence must fail gracefully as False (the caller
+    # /coordinator re-reads real state), NOT surface a raw BleakError as a 500.
+    spec = _ha_spec(4, "weekdays", weekday_mask=0x7F, start_mins=(360,),
+                    zones=((0, 180),), name="D", enabled=False)
+    dev = _make_gen2()
+    dev.connection = _WriteDesyncConn(dev, dumps=[_dump_stream([], mask=0)])
+    ok = asyncio.run(dev.set_program(spec))
+    assert ok is False                      # graceful, not a raised exception
+    assert dev.connection.disconnects == 1  # session still torn down (finally ran)
+
+
+def test_program_and_controller_writes_return_false_on_desync():
+    # The Program A-D enable switches and the Automatic-watering switch drive
+    # these; a marginal-link write must return False, never raise to the switch.
+    dev = _make_gen2()
+    dev.connection = _WriteDesyncConn(dev, dumps=[_dump_stream([], mask=0)])
+    assert asyncio.run(dev.set_program_enabled(1, True)) is False
+    assert asyncio.run(dev.delete_program(1)) is False
+    assert asyncio.run(dev.set_controller_mode(True)) is False
+
+
 def test_set_controller_mode_confirms_via_status():
     dev = _make_gen2()
     dev.connection = _FakeProgramConn(dev, status_pt=_status_with_mode(1))
@@ -508,3 +610,66 @@ def test_refresh_state_reads_programs_on_idle_poll():
     # the #10 syncRequest went out on the idle poll (via send_stream)
     assert any(rx._pb_field(rx.pb_parse(rx.decode_inner(f) or b""), 10) is not None
                for f in dev.connection.streamed)
+
+
+# --- PR#31 round-2 review regressions ---------------------------------------
+
+def test_next_start_clears_when_16_9_absent():
+    # Finding 1 / class "protobuf zero-omission -> clear-on-absence": the device
+    # omits zero-valued #16.#9, so disabling/deleting the last program stops it
+    # emitting #9. A later #16 status with NO #9 must CLEAR the Next-run state, not
+    # freeze it at the old timestamp (which also blocked a stale false-confirm).
+    dev = _make_gen2()
+    dev._observe_plaintext(_status_with_next_start(0b0010, epoch=1_700_000_000))
+    assert dev.state.next_start_flags == 0b0010
+    assert dev.state.next_start_at is not None
+    dev._observe_plaintext(_status_idle())          # #16 present, #9 absent
+    assert dev.state.next_start_flags is None
+    assert dev.state.next_start_at is None
+
+
+def test_set_program_disable_confirm_fails_safe_on_dropped_mask():
+    # Finding 3 / class "frame-drop None handling is symmetric": a DISABLE whose
+    # confirm read drops the #20 mask (mask=None) must not confirm True unverified.
+    # Routing through _enable_mask reports it unconfirmed (the safe direction) — the
+    # old `(mask2 or 0) & bit == on` returned True for a disable without verifying.
+    a = tx._build_program_pb(_ha_spec(1, "odd", start_mins=(360,), zones=((0, 60),), name="A"))
+    dev = _make_gen2()
+    dev.state.programs = {1: ProgramSummary(slot=1, empty=False, enabled=True, name="A")}
+    dev.connection = _FakeProgramConn(
+        dev,
+        # pre-write read has the mask; the confirm read DROPS the trailing #20 frame
+        dumps=[_dump_stream([a], mask=1), _dump_stream([a], mask=None)],
+    )
+    assert asyncio.run(dev.set_program_enabled(1, False)) is False
+
+
+def test_read_programs_clears_stale_on_empty_but_coherent_dump():
+    # Finding 5 / class "clear-on-absence": all programs deleted via the app on
+    # hardware that OMITS deleted slots -> a coherent dump (a #20 mask and/or #16
+    # status decoded, zero #19 bodies) must CLEAR last-known, not retain a stale
+    # schedule forever. Contrast with the truncated-read test above (mask+status
+    # both None) which must PRESERVE state.
+    dev = _make_gen2()
+    dev.state.programs = {1: ProgramSummary(slot=1, empty=False, enabled=True, name="Stale")}
+    dev.connection = _ScriptedStreamConn(dev, streams=[_dump_stream([], mask=0)])
+    programs = asyncio.run(dev.get_programs())
+    assert programs == {}
+    assert dev.state.programs == {}   # stale schedule cleared
+
+
+def test_parse_start_minutes_accepts_hhmm_and_hhmmss():
+    # Finding 2 / class "service-input coercion footguns".
+    assert parse_start_minutes("06:00") == 360
+    assert parse_start_minutes("18:00") == 1080
+    assert parse_start_minutes("06:00:30") == 360   # HA time-selector HH:MM:SS, secs dropped
+    assert parse_start_minutes("23:59") == 1439
+
+
+@pytest.mark.parametrize("bad", ["1080", 1080, "24:00", "12:60", "18:00:00:00", "abc", ""])
+def test_parse_start_minutes_rejects_footguns(bad):
+    # "1080"/1080 is the YAML sexagesimal footgun (unquoted 18:00 -> int 1080 ->
+    # cv.string "1080"); the old `% 1440` math silently scheduled MIDNIGHT. Reject
+    # rather than wrap, and reject out-of-range / non-time tokens.
+    with pytest.raises(ValueError):
+        parse_start_minutes(bad)

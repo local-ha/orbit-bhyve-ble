@@ -6,15 +6,22 @@ only at setup time and on user-triggered refresh; runtime is BLE-only.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from typing import Any
 
 import voluptuous as vol
+from bleak.exc import BleakError
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+    ServiceValidationError,
+)
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -38,7 +45,13 @@ from .const import (
 )
 from .coordinator import BHyveDeviceCoordinator
 from .devices import UnsupportedModel, build_device
-from .devices.base import PROGRAM_SLOTS, SLOT_LETTERS, ProgramSpec, ProgramSummary
+from .devices.base import (
+    PROGRAM_SLOTS,
+    SLOT_LETTERS,
+    ProgramSpec,
+    ProgramSummary,
+    parse_start_minutes,
+)
 from .devices.protobuf import BHyveProtobufDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -202,11 +215,15 @@ def _spec_from_call(call: ServiceCall) -> ProgramSpec:
         for d in days:
             weekday_mask |= 1 << _WEEKDAY_BITS[d[:3].lower()]
         if not weekday_mask:
-            raise HomeAssistantError("weekdays mode needs at least one weekday")
-    start_mins: list[int] = []
-    for tok in call.data["start_times"]:
-        h, _, m = str(tok).partition(":")
-        start_mins.append((int(h) * 60 + int(m or 0)) % 1440)
+            raise ServiceValidationError("weekdays mode needs at least one weekday")
+    elif day_mode == "interval" and not call.data.get("interval_days"):
+        # Symmetric with the weekdays check: don't let a missing interval_days
+        # silently fall back to every-1-day in _build_program_pb.
+        raise ServiceValidationError("interval mode needs interval_days")
+    try:
+        start_mins = [parse_start_minutes(tok) for tok in call.data["start_times"]]
+    except ValueError as err:
+        raise ServiceValidationError(str(err)) from err
     zones: list[tuple[int, int]] = []
     for z in call.data["zones"]:
         zones.append((int(z["zone"]) - 1, int(z["minutes"]) * 60))
@@ -485,15 +502,29 @@ def _register_services(hass: HomeAssistant) -> None:
         slot_filter = call.data.get("slot")
         result: dict[str, Any] = {}
         for coord in coords:
-            programs = await coord.device.get_programs()
-            await coord.async_request_refresh()
+            try:
+                programs = await coord.device.get_programs()
+            except (BleakError, asyncio.TimeoutError) as err:
+                # On-demand read over a marginal BLE link: surface a clean HA error
+                # instead of a raw BleakError to the service caller (mirrors the write
+                # path's _ble_write_guard).
+                raise HomeAssistantError(
+                    f"could not read programs from {coord.device.name}: {err}"
+                ) from err
+            # get_programs() already refreshed state.programs over its own ephemeral
+            # session; push that to the entities without a second BLE connect (a
+            # full async_request_refresh would re-poll the device for a read-only call).
+            coord.async_set_updated_data(coord.device.state)
             slots = programs
             if slot_filter:
                 sid = PROGRAM_SLOTS[slot_filter.upper()]
                 slots = {sid: programs[sid]} if sid in programs else {}
-            result[coord.device.name] = [
-                _summary_to_dict(programs[sid]) for sid in sorted(slots)
-            ]
+            # Key by the device MAC (unique) with a name field, so two same-named
+            # devices can't clobber each other in the response.
+            result[coord.device.mac] = {
+                "name": coord.device.name,
+                "programs": [_summary_to_dict(programs[sid]) for sid in sorted(slots)],
+            }
         return {"devices": result}
 
     hass.services.async_register(

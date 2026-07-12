@@ -34,10 +34,13 @@ def main() -> int:
     ).stdout.strip() or "<branch>"
     print(
         "\nPREFLIGHT OK (local tests passed).\n"
-        "Next, validate on GitHub (Hassfest + HACS) before opening/updating the PR:\n"
-        f"  gh workflow run validate.yaml --ref {branch}\n"
-        "then confirm both jobs are green:\n"
-        "  gh run list --workflow validate.yaml --limit 1"
+        "Before opening/updating the PR:\n"
+        "  1. Self-review against the recurring-finding checklist\n"
+        "     (../local_orbit-bhyve-ble/checklists/pre-pr-review.md).\n"
+        "  2. Validate on GitHub (Hassfest + HACS):\n"
+        f"     gh workflow run validate.yaml --ref {branch}\n"
+        "     then confirm both jobs are green:\n"
+        "     gh run list --workflow validate.yaml --limit 1"
     )
     return 0
 
