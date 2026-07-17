@@ -111,8 +111,16 @@ from your device name/area, so treat the examples below as patterns.
   shows up too. Attributes: `station`, `seconds_remaining`, `rain_delay_minutes`,
   `rain_delay_ends`, `last_command`, `last_command_at`.
 - **Battery (%)** and **Battery voltage (mV)** — live, BLE-decoded on each poll.
-  Voltage is disabled by default. (% is a linear approximation of the discharge
-  curve; for NiMH cells trust the voltage — see the caveat in `docs/`.)
+  Voltage is disabled by default. The **%** is a linear voltage gauge whose
+  discharge curve is chosen by the **Battery chemistry** selector below.
+- **Battery chemistry** (`select`, config) — the AA cell chemistry you installed
+  (**Alkaline** / **Ni-MH rechargeable** / **Lithium primary** / **Lithium
+  regulated 1.5 V**), which picks the voltage→percent curve. It can't be
+  auto-detected (a 2550 mV reading could be alkaline at 25% or Ni-MH at 80%).
+  Changing it re-gauges the % immediately. **Note:** *regulated 1.5 V Li-Ion*
+  cells output a constant ~1.5 V until they abruptly die, so no percentage gauge
+  can track them — the % will read full right up until the valve goes dead
+  (watch the voltage sensor instead).
 - **Signal strength (RSSI)** — from HA's Bluetooth manager; disabled by default.
 - **Connected** (diagnostic) — true when the *last poll reached the device*
   (under the ephemeral model the link is torn down between polls, so this means
