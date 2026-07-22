@@ -33,24 +33,27 @@ from .const import (
     CONF_EMAIL,
     CONF_FLOW_COUNTS_PER_GALLON,
     CONF_IDLE_DISCONNECT,
+    CONF_MESH_STATUS_POLL,
     CONF_PASSWORD,
     CONF_POLL_IDLE,
     CONF_POLL_WATERING,
     DEFAULT_DURATION,
     DEFAULT_FLOW_COUNTS_PER_GALLON,
     DEFAULT_IDLE_DISCONNECT,
+    DEFAULT_MESH_STATUS_POLL,
     DEFAULT_POLL_IDLE,
     DEFAULT_POLL_WATERING,
     DOMAIN,
 )
 from .coordinator import BHyveDeviceCoordinator
-from .devices import UnsupportedModel, build_device
+from .devices import BHyveHT25Device, UnsupportedModel, build_device
 from .devices.base import (
     PROGRAM_SLOTS,
     SLOT_LETTERS,
     ProgramSpec,
     ProgramSummary,
     parse_start_minutes,
+    validate_program_name,
 )
 from .devices.protobuf import BHyveProtobufDevice
 
@@ -89,6 +92,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     flow_counts_per_gallon = opts.get(
         CONF_FLOW_COUNTS_PER_GALLON, DEFAULT_FLOW_COUNTS_PER_GALLON
     )
+    mesh_status_poll = opts.get(CONF_MESH_STATUS_POLL, DEFAULT_MESH_STATUS_POLL)
 
     runtime = EntryRuntime()
     for record in devices:
@@ -106,6 +110,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except UnsupportedModel as err:
             _LOGGER.warning("%s: %s — skipping", record.get("name"), err)
             continue
+        if isinstance(device, BHyveHT25Device):
+            device.active_status_poll = mesh_status_poll
         coord = BHyveDeviceCoordinator(
             hass, device, poll_idle_sec=poll_idle, poll_watering_sec=poll_watering,
         )
@@ -175,10 +181,13 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     flow_counts_per_gallon = opts.get(
         CONF_FLOW_COUNTS_PER_GALLON, DEFAULT_FLOW_COUNTS_PER_GALLON
     )
+    mesh_status_poll = opts.get(CONF_MESH_STATUS_POLL, DEFAULT_MESH_STATUS_POLL)
     for coord in runtime.coordinators.values():
         coord.poll_idle = poll_idle
         coord.poll_watering = poll_watering
         coord.device.flow_counts_per_gallon = flow_counts_per_gallon
+        if isinstance(coord.device, BHyveHT25Device):
+            coord.device.active_status_poll = mesh_status_poll
         if coord.device.connection is not None:
             coord.device.connection._idle_sec = idle_disconnect
         # Re-apply the interval for the current state so a changed cadence takes
@@ -235,6 +244,7 @@ def _spec_from_call(call: ServiceCall) -> ProgramSpec:
         raise ServiceValidationError("interval mode needs interval_days")
     try:
         start_mins = [parse_start_minutes(tok) for tok in call.data["start_times"]]
+        name = validate_program_name(call.data.get("name", ""))
     except ValueError as err:
         raise ServiceValidationError(str(err)) from err
     zones: list[tuple[int, int]] = []
@@ -248,7 +258,7 @@ def _spec_from_call(call: ServiceCall) -> ProgramSpec:
         interval_anchor=call.data.get("interval_anchor"),
         start_mins=tuple(start_mins),
         zones=tuple(zones),
-        name=call.data.get("name", ""),
+        name=name,
         budget=int(call.data.get("budget", 100)),
         enabled=bool(call.data.get("enabled", False)),
     )

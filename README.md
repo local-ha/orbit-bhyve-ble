@@ -132,6 +132,10 @@ from your device name/area, so treat the examples below as patterns.
 - **Watering duration** (`number`, minutes) — the duration a valve uses when
   opened without an explicit one. Restored across restarts.
 - **Sync** button — forces a fresh BLE connect + status read on demand.
+- **Download diagnostics** — the config entry and each device support HA's
+  standard diagnostics download (Settings → Devices & Services → ⋮ → Download
+  diagnostics): device records, live state, and poll health, with credentials
+  and BLE network keys redacted. Attach it to bug reports.
 
 **Protobuf family only (Gen2 + XD):**
 
@@ -152,6 +156,10 @@ from your device name/area, so treat the examples below as patterns.
   controller is off).
 - **Identify** button — flashes the device LED to locate it (Gen2; a harmless
   no-op on the XD).
+- **Problem** binary sensor — the device's own fault report (`#16.#7`
+  `faultStatus`): pump, battery, voltage-boost, flow anomalies and per-station
+  faults, each flag exposed as an attribute. Off when the device reports no
+  faults.
 
 **Gen2 (`HT25G2`) only:**
 
@@ -160,6 +168,16 @@ from your device name/area, so treat the examples below as patterns.
   updates live during watering, or on demand via the button / an automation
   (leak-check while idle, "is water actually moving?"). It's a rate, not a meter —
   see [Cumulative water usage](#cumulative-water-usage-integration-helper).
+- **Water used** (gallons) — cumulative total integrated from the flow sensor,
+  built in (no Integration helper needed) and restored across restarts, so it
+  plugs straight into HA's Water dashboard. Calibrate with **Flow calibration**.
+- **Flow rate (device)** (gal/min, diagnostic, disabled by default) — the
+  device's own reported GPM field (`#59.#4`), surfaced to confirm whether it
+  ever populates on our firmware.
+- **Leak detected** and **No flow** binary sensors — derived from the fault
+  report: water moving while the valve is commanded closed (leak), and valve
+  open but nothing flowing (no-flow). **No flow** is disabled by default until
+  field-confirmed — test it by starting a run with the faucet closed.
 
 ---
 
@@ -344,6 +362,12 @@ Changes apply **live, without a reload** — safe to tune mid-run.
   Re-calibrate by running a known volume and dividing the flow-counter delta by
   the gallons collected. **A smaller number reports a *higher* gal/min** (rate =
   counts ÷ this ÷ time), so to *halve* the reading, *double* the number.
+- **Mesh live status poll** (bool, default off) — HT25 mesh timers. By default
+  mesh state is derived passively from command acks + a wall-clock timer to spare
+  the AA batteries; enabling this makes each idle poll connect and read the
+  device's real watering state, countdown, and battery, so runs started from the
+  app or a hub schedule show up within one poll (~96 BLE connects/day at the
+  default idle cadence).
 
 ## Battery impact & polling cadences
 

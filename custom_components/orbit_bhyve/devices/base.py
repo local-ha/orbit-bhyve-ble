@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..connection import BHyveBleConnection
@@ -61,6 +61,30 @@ SLOT_LETTERS = {v: k for k, v in PROGRAM_SLOTS.items()}
 # and summary sensor.
 UI_SLOTS = ("A", "B", "C", "D")
 
+# The device stores the program name (#17 in setProgramSchedule) in a fixed
+# 32-byte field. A longer name makes the device reject the WHOLE #19 store while
+# the separate #20 enable still lands, so the slot reports "enabled" but keeps its
+# OLD schedule (a silent write-and-lose). Verified on HT34A fw0107 and HT25G2
+# fw0111 (32 bytes stored; 33 rejected on both). Reject early instead.
+MAX_PROGRAM_NAME_BYTES = 32
+
+
+def validate_program_name(name: str) -> str:
+    """Return `name` unchanged, or raise ``ValueError`` if it overflows the
+    device's 32-byte program-name field (see ``MAX_PROGRAM_NAME_BYTES``). The
+    limit is UTF-8 *bytes*, not characters — the firmware buffer is byte-sized, so
+    a 16-char accented name can already be 32 bytes. Kept HA-free so it is
+    unit-testable standalone; the service layer maps ``ValueError`` to a
+    ``ServiceValidationError`` (same contract as ``parse_start_minutes``)."""
+    n = len(name.encode("utf-8"))
+    if n > MAX_PROGRAM_NAME_BYTES:
+        raise ValueError(
+            f"program name is too long: {n} bytes (max {MAX_PROGRAM_NAME_BYTES}). "
+            "The device silently rejects the whole program when the name overflows "
+            "its 32-byte field — shorten the name."
+        )
+    return name
+
 
 def parse_start_minutes(tok: object) -> int:
     """Parse one program start-time token to minutes-from-midnight (0..1439).
@@ -84,6 +108,20 @@ def parse_start_minutes(tok: object) -> int:
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         raise ValueError(f"start_times entry out of range: {tok!r}")
     return hour * 60 + minute
+
+
+def accumulate_gallons(
+    total: float, prev_gpm: float | None, dt_sec: float, cap_sec: float
+) -> float:
+    """One left-rectangle step of the "Water used" integral: book `prev_gpm` —
+    the rate that was live at the START of the interval — over `dt_sec`,
+    bounded by `cap_sec` so a restart/outage gap can't book a huge block of
+    phantom gallons. The caller gates on "previous update was watering"; this
+    handles only the math. Kept HA-free so it is unit-testable standalone
+    (same rationale as parse_start_minutes)."""
+    if not prev_gpm or prev_gpm <= 0 or dt_sec <= 0:
+        return total
+    return total + prev_gpm * (min(dt_sec, cap_sec) / 60.0)
 
 
 @dataclass
@@ -121,6 +159,44 @@ class ProgramSummary:
     budget: int | None = None
 
 
+@dataclass(frozen=True)
+class FaultStatus:
+    """Decoded #16.#7 faultStatus block (OrbitPbApi_FaultStatus, see
+    docs/ble-messages.md). Protobuf omits false bools, so a present-but-empty
+    block (`3a 00` — what a healthy idle status carries) decodes to the
+    all-False "no faults" report; a MISSING block means the frame carried no
+    fault report at all and the consumer must keep its last-known value."""
+
+    pump_fault: bool = False           # #7.#1
+    voltage_boost_fail: bool = False   # #7.#4 voltageBoostCircuitFail
+    valve_off_flow: bool = False       # #7.#5 flow with valve commanded closed = leak
+    valve_on_no_flow: bool = False     # #7.#6 no flow during a run
+    valve_low_flow: bool = False       # #7.#7
+    valve_high_flow: bool = False      # #7.#8
+    battery_fault: bool = False        # #7.#10
+    station_fault_flags: int = 0       # #7.#2 | (#7.#3 << 32), bit = 0-indexed station
+    accessory_fault_flags: int = 0     # #7.#9 smartAccessoryFaultFlags
+
+    @property
+    def any_fault(self) -> bool:
+        return bool(
+            self.pump_fault
+            or self.voltage_boost_fail
+            or self.valve_off_flow
+            or self.valve_on_no_flow
+            or self.valve_low_flow
+            or self.valve_high_flow
+            or self.battery_fault
+            or self.station_fault_flags
+            or self.accessory_fault_flags
+        )
+
+    @property
+    def station_faults(self) -> tuple[int, ...]:
+        """1-indexed stations whose fault bit is set (bit N = station N+1)."""
+        return tuple(i + 1 for i in range(64) if self.station_fault_flags >> i & 1)
+
+
 @dataclass
 class DeviceState:
     is_watering: bool = False
@@ -128,6 +204,7 @@ class DeviceState:
     seconds_remaining: int | None = None
     flow_total: int | None = None  # #59.#3 raw cumulative counter (transient; feeds flow_gpm)
     flow_gpm: float | None = None  # instantaneous flow rate from read_flow's slope (Gen2)
+    flow_gpm_device: float | None = None  # #59.#4 device-reported gpm float (unconfirmed on HW)
     started_at: datetime | None = None
     expected_off_at: datetime | None = None
     last_command_at: datetime | None = None
@@ -144,6 +221,9 @@ class DeviceState:
     next_start_flags: int | None = None  # #16.#9 nextStartProgramFlags (slot bitmask, A=bit0)
     next_start_at: datetime | None = None  # #16.#10 nextStartTimeSecEpochUTC as an aware datetime
     programs: dict[int, ProgramSummary] = field(default_factory=dict)  # slot(1-6) -> summary
+    # Last fault report (#16.#7). None until a decoded status carries the block;
+    # a frame WITHOUT the block keeps the last-known report (see FaultStatus).
+    faults: FaultStatus | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -164,6 +244,12 @@ class BHyveBleDeviceBase(abc.ABC):
     # only per app captures; the XD has no flow screen. Verify on hardware
     # before trusting (the `flow` CLI probes both) — see docs/ble_protocol.md.
     has_flow: bool = False
+    # Opt-in "Mesh live status poll" option: when True, the mesh (HT25)
+    # refresh_state connects and runs the init's STATUS/INFO queries on each
+    # idle poll instead of staying passive. Costs battery (a BLE connect per
+    # idle tick); applied from the options flow by __init__.py. The protobuf
+    # family ignores it — its poll already connects.
+    active_status_poll: bool = False
 
     def __init__(
         self,
@@ -310,12 +396,75 @@ class BHyveBleDeviceBase(abc.ABC):
         elif seq == 0x02 and len(pt) >= 6:
             # Status reply/push: payload[0] (pt[5]) is the watering mode —
             # 0x04 = watering, 0x01 = idle. Authoritative device state, used to
-            # confirm an actuation actually took.
+            # confirm an actuation actually took and — via the active-run
+            # payload — to sync a run HA didn't start (app/hub/schedule).
             mode = pt[5]
+            was_watering = self.state.is_watering
             if mode == 0x04:
                 self.state.is_watering = True
+                self._apply_mesh_run_payload(pt)
+                if not was_watering:
+                    self._notify_state_changed()
             elif mode == 0x01:
+                # Idle: clear any run bookkeeping (mirrors the STOP-ack clears
+                # in ht25.py); idempotent when nothing was running.
                 self.state.is_watering = False
+                self.state.active_zone = None
+                self.state.seconds_remaining = None
+                self.state.started_at = None
+                self.state.expected_off_at = None
+                if was_watering:
+                    self._notify_state_changed()
+
+    # Mesh STATUS countdown tick rate — HYPOTHESIS pending live calibration.
+    # Evidence (docs/findings/d7-47-protocol.md, captured 600 s run): active
+    # payload `04 c0 95 40 58 02 00` = [state][countdown u16 LE][0x40][duration
+    # u16 LE][00]. 0x95c0 = 38336 counts with the duration echoing 600 s →
+    # 38336/64 = 599 s remaining (1 s into the run), and the adjacent capture
+    # `80 95` is exactly -64 counts = -1 s. The 24-bit reading (counter
+    # including the 0x40 byte) fails the same arithmetic. Byte 3's 0x40 needs a
+    # >1023 s run to resolve (constant flag vs. counter bits 16-21 OR'd with
+    # 0x40); until then its low 6 bits are treated as high counter bits and the
+    # result is sanity-gated against the duration echo below.
+    _MESH_COUNTDOWN_HZ = 64
+
+    def _apply_mesh_run_payload(self, pt: bytes) -> None:
+        """Decode the active-STATUS payload (mode 0x04) into the live countdown:
+        payload[1:3]+bits of [3] = remaining counts, payload[4:6] = requested
+        duration (seconds, u16 LE). Frame offsets: payload[k] = pt[5+k]."""
+        if len(pt) < 12:
+            return  # short frame: mode byte only, no countdown payload
+        counts = int.from_bytes(pt[6:8], "little") | ((pt[8] & 0x3F) << 16)
+        duration = int.from_bytes(pt[9:11], "little")
+        # Raw bytes for the calibration/diagnostics loop (mode..payload end).
+        self.state.extra["mesh_status_raw"] = pt[5:12].hex()
+        remaining = counts // self._MESH_COUNTDOWN_HZ
+        if not (0 < duration <= 0xFFFF and remaining <= duration):
+            # Fails the duration cross-check — tick-rate hypothesis doesn't fit
+            # this frame, so keep is_watering but don't trust the countdown.
+            _LOGGER.debug(
+                "%s: mesh STATUS countdown failed sanity (raw=%s counts=%d "
+                "duration=%ds) — not applied",
+                self.mac, pt[5:12].hex(), counts, duration,
+            )
+            return
+        now = datetime.now(timezone.utc)
+        self.state.seconds_remaining = remaining
+        if self.state.active_zone is None:
+            self.state.active_zone = 1  # mesh HT25 is single-station
+        if self.state.started_at is None:
+            # Run discovered externally (app/hub/schedule) — synthesize the
+            # start from the duration echo so attributes stay coherent.
+            self.state.started_at = now - timedelta(seconds=duration - remaining)
+        new_off = now + timedelta(seconds=remaining)
+        if (
+            self.state.expected_off_at is None
+            or new_off < self.state.expected_off_at - timedelta(seconds=15)
+        ):
+            # Same guard as the protobuf path (status.py): only ever move the
+            # wall-clock auto-close EARLIER, so a re-reported run can't keep
+            # postponing the close.
+            self.state.expected_off_at = new_off
 
     @abc.abstractmethod
     async def start_watering(self, station: int, duration_sec: int) -> bool:
