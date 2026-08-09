@@ -2,7 +2,8 @@
 
 Discovers all devices on an Orbit account, instantiates a per-device class
 based on hardware/firmware, and creates entity platforms. Cloud is touched
-only at setup time and on user-triggered refresh; runtime is BLE-only.
+only at setup time and on a user-triggered refresh (the refresh_devices service
+or the reconfigure flow); runtime is BLE-only.
 """
 from __future__ import annotations
 
@@ -13,29 +14,24 @@ from typing import Any
 
 import voluptuous as vol
 from bleak.exc import BleakError
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import (
-    ConfigEntryAuthFailed,
     ConfigEntryNotReady,
     HomeAssistantError,
     ServiceValidationError,
 )
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .cloud import CloudAuthError, CloudConnectionError, OrbitCloudClient
 from .const import (
     CONF_DEFAULT_DURATION,
     CONF_DEVICES,
-    CONF_EMAIL,
     CONF_FLOW_COUNTS_PER_GALLON,
     CONF_IDLE_DISCONNECT,
     CONF_HUB_MESH_OVERRIDES,
     CONF_MESH_STATUS_POLL,
-    CONF_PASSWORD,
     CONF_POLL_IDLE,
     CONF_POLL_WATERING,
     DEFAULT_DURATION,
@@ -59,6 +55,7 @@ from .devices.base import (
     validate_program_name,
 )
 from .devices.protobuf import BHyveProtobufDevice
+from .refresh import async_refresh_entry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -128,6 +125,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = runtime
 
+    # Before the platforms recreate device entries: drop registry devices the
+    # user removed via the reconfigure picker, so they don't linger forever as
+    # unavailable. Must run here, not after the forward.
+    _purge_unconfigured_devices(
+        hass, entry, {r["cloud_id"] for r in devices if r.get("cloud_id")}
+    )
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     _register_services(hass)
@@ -154,6 +158,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
+def _purge_unconfigured_devices(
+    hass: HomeAssistant, entry: ConfigEntry, keep: set[str]
+) -> None:
+    """Drop registry devices whose cloud_id is no longer in CONF_DEVICES.
+
+    Keyed off CONF_DEVICES, NOT runtime.coordinators: build_device legitimately
+    skips an UnsupportedModel while the record stays configured, and purging on
+    that would delete a device the user still owns. CONF_DEVICES only shrinks
+    from an explicit user action in the reconfigure picker, so this is
+    deterministic rather than driven by whatever the cloud happened to return.
+    """
+    reg = dr.async_get(hass)
+    for dev in dr.async_entries_for_config_entry(reg, entry.entry_id):
+        ids = {i[1] for i in dev.identifiers if i[0] == DOMAIN}
+        if ids and not (ids & keep):
+            _LOGGER.debug("%s: removing unconfigured device %s", entry.entry_id, ids)
+            reg.async_update_device(dev.id, remove_config_entry_id=entry.entry_id)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device_entry: dr.DeviceEntry
+) -> bool:
+    """Enable the device page's delete button once a device is deconfigured.
+
+    Refuses while the device is still in CONF_DEVICES — the supported way to
+    remove one is to uncheck it in the reconfigure picker, which then makes this
+    return True on the next setup.
+    """
+    cloud_ids = {i[1] for i in device_entry.identifiers if i[0] == DOMAIN}
+    configured = {
+        r.get("cloud_id") for r in entry.data.get(CONF_DEVICES, [])
+    }
+    return not (cloud_ids & configured)
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     runtime: EntryRuntime | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if runtime:
@@ -176,10 +215,15 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     (a full HA restart) clears the stale session. So for our tuning options (flow
     calibration, poll intervals, idle disconnect) we mutate the live coordinators
     instead. Device-list/credential changes take a different path
-    (refresh_devices / reauth) that reloads explicitly."""
+    (refresh_devices / reconfigure / reauth) that reloads explicitly."""
     runtime: EntryRuntime | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if runtime is None:
-        await hass.config_entries.async_reload(entry.entry_id)
+        # Those explicit paths call async_update_entry (which fires this
+        # listener) and then reload themselves. Without the state guard the two
+        # reloads overlap on one entry — so only reload when nothing else is
+        # already mid-flight.
+        if entry.state is ConfigEntryState.LOADED:
+            await hass.config_entries.async_reload(entry.entry_id)
         return
     opts = entry.options
     idle_disconnect = opts.get(CONF_IDLE_DISCONNECT, DEFAULT_IDLE_DISCONNECT)
@@ -300,27 +344,27 @@ def _register_services(hass: HomeAssistant) -> None:
         return
 
     async def refresh_devices(call: ServiceCall) -> None:
-        for entry in hass.config_entries.async_entries(DOMAIN):
-            email = entry.data.get(CONF_EMAIL)
-            password = entry.data.get(CONF_PASSWORD)
-            if not (email and password):
-                continue
-            client = OrbitCloudClient(async_get_clientsession(hass))
-            try:
-                discovered = await client.discover(email, password)
-            except CloudAuthError as err:
-                _LOGGER.error("Refresh: auth failed for %s: %s", email, err)
-                raise ConfigEntryAuthFailed(str(err)) from err
-            except CloudConnectionError as err:
-                _LOGGER.error("Refresh: cloud unreachable for %s: %s", email, err)
-                continue
-            hass.config_entries.async_update_entry(
-                entry, data={**entry.data, CONF_DEVICES: discovered},
-            )
-            await hass.config_entries.async_reload(entry.entry_id)
+        wanted = call.data.get("config_entry_id")
+        entries = hass.config_entries.async_entries(DOMAIN)
+        if wanted:
+            wanted_ids = set(wanted)
+            entries = [e for e in entries if e.entry_id in wanted_ids]
+            if not entries:
+                raise ServiceValidationError(
+                    f"No orbit_bhyve config entry matches {sorted(wanted_ids)}"
+                )
+        for entry in entries:
+            await async_refresh_entry(hass, entry)
 
     hass.services.async_register(
-        DOMAIN, "refresh_devices", refresh_devices, schema=vol.Schema({}),
+        DOMAIN,
+        "refresh_devices",
+        refresh_devices,
+        # Optional target; omitting it keeps the historical all-entries
+        # behaviour so existing automations don't change meaning.
+        schema=vol.Schema({
+            vol.Optional("config_entry_id"): vol.All(cv.ensure_list, [cv.string]),
+        }),
     )
 
     async def start_watering(call: ServiceCall) -> None:

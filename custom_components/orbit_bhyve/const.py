@@ -38,6 +38,12 @@ CLOUD_KEY_FIELDS = ("ble_network_key", "network_key")
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_DEVICES = "devices"
+# Every cloud_id ever offered in a device picker — kept AND excluded. Lets the
+# reconfigure flow tell "you unchecked this on purpose" apart from "this is new
+# hardware", which CONF_DEVICES alone can't express (it only holds the keepers).
+# Append-only, so a bug degrades to a device showing up pre-checked in a form
+# the user is looking at, never to a device being permanently hidden.
+CONF_KNOWN_CLOUD_IDS = "known_cloud_ids"
 CONF_INCLUDE = "include"
 CONF_DEFAULT_DURATION = "default_duration_sec"
 CONF_IDLE_DISCONNECT = "idle_disconnect_sec"
@@ -89,7 +95,12 @@ DEFAULT_FLOW_COUNTS_PER_GALLON = 433
 #     "mesh_id":        str,
 #     "mesh_device_id": int | None,
 #     "bridge_device_id": str | None,
+#     "hub_mesh_device_id": int | None,
 #     "network_key":    str (32 hex chars),
 #     "battery_pct":    int | None,
 #     "battery_mv":     int | None,
 #   }
+#
+# Sibling of "devices" under entry.data:
+#   "known_cloud_ids": list[str] — see CONF_KNOWN_CLOUD_IDS. Absent on entries
+#   created before the reconfigure flow existed; readers must tolerate None.

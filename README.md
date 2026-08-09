@@ -24,7 +24,7 @@ when the WAN goes down.
 | Hose-tap timer    | `HT25-0000`    | `0085`           | ✅ Actuated end-to-end                   |
 | Hose-tap timer    | `HT25-0000`    | `0041`           | ✅ Actuated end-to-end (per-device mesh-ID addressing) |
 | Hose-tap timer (Gen2) | `HT25G2-0001` | `0111`          | ✅ Actuated end-to-end (protobuf protocol) |
-| Hose-tap timer (Gen2, 90205Z) | `HT25A-0001` | `0098`  | ✅ Connect/actuate verified by community member (issue #47); flow-sensor readings not yet confirmed on this variant |
+| Hose-tap timer (Gen2, 90205Z) | `HT25A-0001` | `0098`  | ✅ Actuated end-to-end on hardware, plus programs (A–D) and rain delay / next run; flow-sensor readings not yet confirmed on this variant |
 | 4-port XD         | `HT34A-0001`   | `0107`           | ✅ Battery/status decode verified on hardware; XD actuation proven via HT32A sibling |
 | 4-port XD         | `HT34-0001`    | `0058`           | ⚠️ Shares the XD protobuf protocol; not tested here |
 | 2-port XD         | `HT32A-0001`   | `0107`           | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
@@ -170,7 +170,11 @@ registry.
 - `orbit_bhyve.start_watering` — `entity_id` + optional `duration` (sec)
 - `orbit_bhyve.stop_all` — stop everything on the targeted device
 - `orbit_bhyve.refresh_devices` — re-query the cloud (for new devices, key
-  rotation, or fw changes); manual, no background polling
+  rotation, or fw changes) and **merge** the result: adds new devices, keeps
+  devices you excluded excluded, and never overwrites a working network key or
+  mesh ID with a blank one. Optional `config_entry_id` targets one account;
+  omit it to refresh all. Manual, no background polling. For a UI equivalent
+  with a device picker, use **Reconfigure** (below)
 - `orbit_bhyve.get_program` — read back a program slot (A–F) as structured
   data (`SupportsResponse.ONLY`): days, start times, per-zone durations
 - `orbit_bhyve.set_program` — store/replace a program in a slot: watering
@@ -206,9 +210,41 @@ registry.
   over BLE on each idle poll to read live watering state and battery.
   Battery trade-off: ~96 connects/day at the default idle cadence
 
+## Reconfigure (adding a device you bought later)
+
+The device list is captured in the config entry at setup and is **not**
+refreshed by a reload or an HA restart, so a newly-purchased timer won't appear
+on its own. Adding the account a second time doesn't work either — the entry is
+keyed on your email, so the flow aborts with "already configured".
+
+Settings → Devices & Services → Orbit B-Hyve BLE → ⋮ → **Reconfigure**:
+
+1. Re-runs cloud discovery with the saved credentials. You're only prompted for
+   a password if Orbit rejects them
+2. Re-shows the device picker. **New devices are pre-checked**; devices you
+   excluded before stay unchecked
+3. Devices the cloud no longer returns are labelled *"no longer on the Orbit
+   account"* and stay pre-checked — they keep working over BLE. Uncheck one to
+   remove it and its entities. This is deliberate: cloud discovery skips
+   anything missing a `mesh_id`, so a partial response must not silently delete
+   a working device
+4. Submitting updates the entry and reloads it
+
+Two things worth knowing:
+
+- The **first** reconfigure of an entry created before this feature existed may
+  show previously-excluded devices as checked, because the old entry never
+  recorded which ones you excluded. Uncheck them once and the choice sticks.
+- Re-discovery never overwrites a working `network_key` or `hub_mesh_device_id`
+  with a blank cloud value. This matters if you rely on **Hub mesh ID
+  overrides** — a partial `/networks` response would otherwise drop the device
+  back to the `0x0000` placeholder and your watering commands would start
+  getting dropped with only a log warning to show for it.
+
 ## How it works
 
-1. **Setup**: log into Orbit cloud once → fetch device list → fetch one AES
+1. **Setup**: log into Orbit cloud at setup — and again only when you
+   reconfigure or call `refresh_devices` → fetch device list → fetch one AES
    network key per mesh → cache everything in the config entry
 2. **Per command**: the integration's pooled BLE connection (one per device)
    does an AES handshake, runs the model-specific init sequence on first

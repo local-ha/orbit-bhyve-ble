@@ -25,7 +25,19 @@ stop_all:
 
 refresh_devices:
   name: Refresh devices from cloud
-  description: Re-query the Orbit cloud for new/changed devices and updated network keys. Manual; no background polling.
+  description: >-
+    Re-query the Orbit cloud and merge the result into the config entry: adds
+    newly-discovered devices, keeps devices you excluded excluded, and never
+    overwrites a working network key or mesh ID with a blank one. Manual; no
+    background polling.
+  fields:
+    config_entry_id:
+      name: Account
+      description: Which B-Hyve account to refresh. Omit to refresh every configured account.
+      required: false
+      selector:
+        config_entry:
+          integration: orbit_bhyve
 
 set_program:
   name: Set watering program
