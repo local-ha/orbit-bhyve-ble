@@ -4,6 +4,11 @@ Two-step setup:
   1. Email + password → cloud login + device discovery.
   2. Device picker — uncheck any to exclude.
 
+Reconfigure flow (⋮ → Reconfigure) re-runs discovery against the same account
+and re-shows the picker, so a device bought after setup can be added without
+deleting the entry — entry.data[CONF_DEVICES] is otherwise a frozen snapshot
+that async_setup_entry never refreshes.
+
 Reauth flow re-prompts only the password.
 Options flow exposes polling intervals + idle disconnect.
 """
@@ -34,6 +39,7 @@ from .const import (
     CONF_MESH_STATUS_POLL,
     CONF_IDLE_DISCONNECT,
     CONF_INCLUDE,
+    CONF_KNOWN_CLOUD_IDS,
     CONF_PASSWORD,
     CONF_POLL_IDLE,
     CONF_POLL_WATERING,
@@ -46,6 +52,7 @@ from .const import (
     DEFAULT_POLL_WATERING,
     DOMAIN,
 )
+from .merge import default_selection, merge_device_lists, next_known_ids
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +64,32 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._email: str | None = None
         self._password: str | None = None
         self._discovered: list[dict[str, Any]] = []
+        # Reconfigure-only state.
+        self._stored: list[dict[str, Any]] = []      # entry.data[CONF_DEVICES]
+        self._catalogue: list[dict[str, Any]] = []   # discovered + stored-only survivors
+        self._default_ids: list[str] = []            # picker pre-check set
+
+    async def _async_discover(self) -> str | None:
+        """Run cloud discovery into self._discovered.
+
+        Returns a strings.json error key, or None on success. Shared by the
+        setup, reconfigure and reconfigure-auth steps so all three classify
+        cloud failures identically.
+        """
+        client = OrbitCloudClient(async_get_clientsession(self.hass))
+        try:
+            self._discovered = await client.discover(self._email, self._password)
+        except CloudAuthError:
+            return "invalid_auth"
+        except CloudConnectionError:
+            return "cannot_connect"
+        except CloudKeyNotFound as err:
+            _LOGGER.error("Network key fetch failed: %s", err)
+            return "unknown"
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Unexpected error during discovery")
+            return "unknown"
+        return None if self._discovered else "no_devices"
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
@@ -68,24 +101,10 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(self._email.lower())
             self._abort_if_unique_id_configured()
 
-            client = OrbitCloudClient(async_get_clientsession(self.hass))
-            try:
-                self._discovered = await client.discover(self._email, self._password)
-            except CloudAuthError:
-                errors["base"] = "invalid_auth"
-            except CloudConnectionError:
-                errors["base"] = "cannot_connect"
-            except CloudKeyNotFound as err:
-                _LOGGER.error("Network key fetch failed: %s", err)
-                errors["base"] = "unknown"
-            except Exception:  # noqa: BLE001
-                _LOGGER.exception("Unexpected error during discovery")
-                errors["base"] = "unknown"
-            else:
-                if not self._discovered:
-                    errors["base"] = "no_devices"
-                else:
-                    return await self.async_step_pick_devices()
+            error = await self._async_discover()
+            if error is None:
+                return await self.async_step_pick_devices()
+            errors["base"] = error
 
         schema = vol.Schema({
             vol.Required(CONF_EMAIL, default=self._email or ""): str,
@@ -93,9 +112,58 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         })
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
+    def _picker_form(
+        self, step_id: str, errors: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
+        """Shared device-picker form for the setup and reconfigure paths."""
+        stored_ids = {r["cloud_id"] for r in self._stored}
+        discovered_ids = {r["cloud_id"] for r in self._discovered}
+
+        options_list = [
+            SelectOptionDict(
+                value=d["cloud_id"],
+                label=f"{d['name']} ({d['hardware']} fw{d['firmware']})"
+                + (
+                    ""
+                    if d["cloud_id"] in discovered_ids
+                    else "  —  no longer on the Orbit account"
+                ),
+            )
+            for d in self._catalogue
+        ]
+        schema = vol.Schema({
+            vol.Required(CONF_INCLUDE, default=self._default_ids): SelectSelector(
+                SelectSelectorConfig(
+                    options=options_list,
+                    multiple=True,
+                    mode=SelectSelectorMode.LIST,
+                )
+            ),
+        })
+        return self.async_show_form(
+            step_id=step_id,
+            data_schema=schema,
+            errors=errors,
+            description_placeholders={
+                "count": str(len(self._catalogue)),
+                "new": str(len([c for c in self._default_ids if c not in stored_ids])),
+                "missing": str(
+                    len([r for r in self._catalogue if r["cloud_id"] not in discovered_ids])
+                ),
+            },
+        )
+
     async def async_step_pick_devices(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        self._catalogue = list(self._discovered)
+        self._default_ids = [d["cloud_id"] for d in self._discovered]
+
         if user_input is not None:
             included = set(user_input[CONF_INCLUDE] or [])
+            if not included:
+                # vol.Required accepts [] on a multi-select, and an empty device
+                # list makes async_setup_entry return False — the entry would be
+                # bricked with nothing but a log warning to explain it.
+                return self._picker_form("pick_devices", {"base": "no_devices_selected"})
             kept = [d for d in self._discovered if d["cloud_id"] in included]
             return self.async_create_entry(
                 title=self._email or "B-Hyve",
@@ -103,6 +171,7 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_EMAIL: self._email,
                     CONF_PASSWORD: self._password,
                     CONF_DEVICES: kept,
+                    CONF_KNOWN_CLOUD_IDS: next_known_ids(None, [], self._default_ids),
                 },
                 options={
                     CONF_DEFAULT_DURATION: DEFAULT_DURATION,
@@ -114,29 +183,97 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 },
             )
 
-        options_list = [
-            SelectOptionDict(
-                value=d["cloud_id"],
-                label=f"{d['name']} ({d['hardware']} fw{d['firmware']})",
-            )
-            for d in self._discovered
-        ]
-        defaults = [d["cloud_id"] for d in self._discovered]
+        return self._picker_form("pick_devices")
 
-        schema = vol.Schema({
-            vol.Required(CONF_INCLUDE, default=defaults): SelectSelector(
-                SelectSelectorConfig(
-                    options=options_list,
-                    multiple=True,
-                    mode=SelectSelectorMode.LIST,
-                )
-            ),
-        })
+    async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """⋮ → Reconfigure: re-run cloud discovery and re-show the device picker.
+
+        Saved credentials are reused silently; only a CloudAuthError drops the
+        user to a password prompt.
+        """
+        entry = self._get_reconfigure_entry()
+        self._email = entry.data.get(CONF_EMAIL)
+        self._password = entry.data.get(CONF_PASSWORD)
+        self._stored = list(entry.data.get(CONF_DEVICES, []))
+
+        if not (self._email and self._password):
+            return await self.async_step_reconfigure_auth()
+
+        error = await self._async_discover()
+        if error == "invalid_auth":
+            return await self.async_step_reconfigure_auth()
+        if error is not None:
+            # No form is on screen yet, so there's nowhere to render an inline
+            # error — abort with a reason the user can read, entry untouched.
+            return self.async_abort(reason=error)
+        return await self.async_step_reconfigure_devices()
+
+    async def async_step_reconfigure_auth(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Password re-prompt when the saved credential no longer authenticates.
+
+        The password captured here is written back to entry.data by the finish
+        path, so a reconfigure doubles as a reauth.
+        """
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            self._password = user_input[CONF_PASSWORD]
+            error = await self._async_discover()
+            if error is None:
+                return await self.async_step_reconfigure_devices()
+            errors["base"] = error
+
         return self.async_show_form(
-            step_id="pick_devices",
-            data_schema=schema,
-            description_placeholders={"count": str(len(self._discovered))},
+            step_id="reconfigure_auth",
+            data_schema=vol.Schema({vol.Required(CONF_PASSWORD): str}),
+            errors=errors,
+            description_placeholders={"email": self._email or ""},
         )
+
+    async def async_step_reconfigure_devices(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        entry = self._get_reconfigure_entry()
+        stored_ids = [r["cloud_id"] for r in self._stored]
+        discovered_ids = {r["cloud_id"] for r in self._discovered}
+
+        # Catalogue = fresh discovery, plus still-configured devices the cloud no
+        # longer returns. Keeping the vanished ones visible and pre-checked is
+        # deliberate: discover() silently skips bridges and anything without a
+        # mesh_id, so a partial response must not delete a working BLE device.
+        self._catalogue = list(self._discovered) + [
+            r for r in self._stored if r["cloud_id"] not in discovered_ids
+        ]
+        known = entry.data.get(CONF_KNOWN_CLOUD_IDS)  # None => pre-reconfigure entry
+        catalogue_ids = [r["cloud_id"] for r in self._catalogue]
+        self._default_ids = default_selection(stored_ids, known, catalogue_ids)
+
+        if user_input is not None:
+            included = set(user_input[CONF_INCLUDE] or [])
+            if not included:
+                return self._picker_form(
+                    "reconfigure_devices", {"base": "no_devices_selected"}
+                )
+            self.hass.config_entries.async_update_entry(
+                entry,
+                data={
+                    **entry.data,
+                    CONF_PASSWORD: self._password,  # picked up if reconfigure_auth ran
+                    CONF_DEVICES: merge_device_lists(
+                        self._stored, self._discovered, included
+                    ),
+                    CONF_KNOWN_CLOUD_IDS: next_known_ids(
+                        known, stored_ids, catalogue_ids
+                    ),
+                },
+            )
+            await self.hass.config_entries.async_reload(entry.entry_id)
+            return self.async_abort(reason="reconfigure_successful")
+
+        return self._picker_form("reconfigure_devices")
+
+    def _get_reconfigure_entry(self) -> ConfigEntry:
+        # Deliberately shadows HA >= 2024.11's ConfigFlow._get_reconfigure_entry
+        # so this flow still works on the 2024.6 floor declared in hacs.json —
+        # same trick as _get_reauth_entry below.
+        return self.hass.config_entries.async_get_entry(self.context["entry_id"])
 
     async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:
         self._email = entry_data.get(CONF_EMAIL)
