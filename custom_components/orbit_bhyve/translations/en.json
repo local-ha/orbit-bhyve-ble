@@ -22,17 +22,36 @@
         "data": {
           "password": "Password"
         }
+      },
+      "reconfigure_auth": {
+        "title": "B-Hyve — confirm password",
+        "description": "The saved password for {email} was rejected by the Orbit cloud. Enter it again to re-run device discovery.",
+        "data": {
+          "password": "Password"
+        }
+      },
+      "reconfigure_devices": {
+        "title": "Update B-Hyve devices",
+        "description": "Re-queried the Orbit cloud: {count} device(s), {new} new, {missing} no longer on the account. New devices are pre-checked; devices you excluded before stay unchecked. Devices marked \"no longer on the Orbit account\" keep working over BLE while they stay checked — uncheck one to remove it and its entities. If this is the first time you have reconfigured this entry, devices you excluded during the original setup may reappear checked: the entry never recorded them. Uncheck them once and the choice sticks.",
+        "data": {
+          "include": "Devices to keep"
+        }
       }
     },
     "error": {
       "invalid_auth": "Invalid email or password.",
       "cannot_connect": "Cannot reach the Orbit cloud API. Check your network connection.",
       "no_devices": "Login succeeded but no devices were found on this account.",
-      "unknown": "Unexpected error."
+      "unknown": "Unexpected error.",
+      "no_devices_selected": "Select at least one device — an empty selection would disable the integration."
     },
     "abort": {
       "already_configured": "An account is already configured.",
-      "reauth_successful": "Re-authentication successful."
+      "reauth_successful": "Re-authentication successful.",
+      "reconfigure_successful": "Device list updated.",
+      "cannot_connect": "Cannot reach the Orbit cloud API. Nothing was changed — try again later.",
+      "no_devices": "The Orbit cloud returned no devices for this account. Nothing was changed.",
+      "unknown": "Unexpected error re-querying the Orbit cloud. Nothing was changed."
     }
   },
   "options": {
@@ -68,7 +87,10 @@
     },
     "refresh_devices": {
       "name": "Refresh devices from cloud",
-      "description": "Re-query the Orbit cloud for new/changed devices and updated network keys."
+      "description": "Re-query the Orbit cloud and merge the result into the config entry: adds newly-discovered devices, keeps devices you excluded excluded, and never overwrites a working network key or mesh ID with a blank one.",
+      "fields": {
+        "config_entry_id": {"name": "Account", "description": "Which B-Hyve account to refresh. Omit to refresh every configured account."}
+      }
     },
     "set_program": {
       "name": "Set watering program",

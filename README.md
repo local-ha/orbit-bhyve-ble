@@ -1,5 +1,17 @@
 # Orbit B-Hyve BLE — Home Assistant integration
 
+<p align="center">
+<img src="https://img.shields.io/github/stars/ljmerza/orbit-bhyve-ble?style=for-the-badge&label=Stars&color=orange" alt="Stars">
+<a href="https://github.com/ljmerza/orbit-bhyve-ble/releases"><img src="https://img.shields.io/github/downloads/ljmerza/orbit-bhyve-ble/total?style=for-the-badge&label=Downloads&color=blue" alt="Downloads"></a>
+<a href="https://github.com/ljmerza/orbit-bhyve-ble/releases/latest"><img src="https://img.shields.io/github/v/release/ljmerza/orbit-bhyve-ble?style=for-the-badge&color=purple" alt="Version"></a>
+<a href="https://github.com/ljmerza/orbit-bhyve-ble/actions/workflows/release.yaml"><img src="https://img.shields.io/github/actions/workflow/status/ljmerza/orbit-bhyve-ble/release.yaml?style=for-the-badge&label=Build" alt="Build"></a>
+<a href="https://github.com/ljmerza/orbit-bhyve-ble/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ljmerza/orbit-bhyve-ble?style=for-the-badge&label=License&color=green" alt="License"></a>
+</p>
+
+<p align="center">
+<a href="https://www.buymeacoffee.com/JMISm06AD"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
+</p>
+
 **Local BLE control for Orbit B-Hyve hose-tap and XD timers.** The Orbit cloud
 is contacted only once, at setup, to discover your devices and fetch their BLE
 network keys. After that every command, status poll, and schedule read happens
@@ -40,6 +52,7 @@ protocol for scripting and diagnostics.
 | Hose-tap timer        | `HT25-0000`    | `0085`          | ✅ Actuated end-to-end (mesh protocol) |
 | Hose-tap timer        | `HT25-0000`    | `0041`          | ✅ Actuated end-to-end (per-device mesh-ID addressing) |
 | Hose-tap timer (Gen2) | `HT25G2-0001`  | `0111`          | ✅ Full stack, hardware-verified (protobuf protocol) |
+| Hose-tap timer (Gen2, 90205Z) | `HT25A-0001` | `0098`  | ✅ Actuated end-to-end on hardware, plus programs (A–D) and rain delay / next run; flow-sensor readings not yet confirmed on this variant |
 | 4-port XD             | `HT34A-0001`   | `0107`          | ✅ Full stack, hardware-verified (protobuf protocol) |
 | 4-port XD             | `HT34-0001`    | `0058`          | ⚠️ Shares the XD protobuf protocol; not tested here |
 | 2-port XD             | `HT32A-0001`   | `0107`          | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
@@ -224,10 +237,10 @@ from your device name/area, so treat the examples below as patterns.
 |---|---|---|
 | `orbit_bhyve.start_watering` | valve `entity_id` | Start a zone for `duration` seconds (optional). |
 | `orbit_bhyve.stop_all` | — | Stop watering on every configured device. |
-| `orbit_bhyve.set_program` | `device_id` | Create/replace a program in slot A–D (protobuf family). |
+| `orbit_bhyve.set_program` | `device_id` | Create/replace a program in slot A–D (protobuf family: HT34A / HT25G2). Watering days (weekdays / even / odd / every-N-days), start time(s), per-zone run durations. Optionally enable it in the same call. |
 | `orbit_bhyve.delete_program` | `device_id` | Clear a program slot A–D. |
-| `orbit_bhyve.get_program` | `device_id` | **Returns a response** with the stored A–D schedules (reads live). |
-| `orbit_bhyve.refresh_devices` | — | Re-query the cloud for new/changed devices + key rotation. Manual. |
+| `orbit_bhyve.get_program` | `device_id` | **Returns a response** with the stored A–D schedules (days, start times, per-zone durations) — reads live. |
+| `orbit_bhyve.refresh_devices` | — | Re-query the cloud for new/changed devices + key rotation, and **merge** the result: adds new devices, keeps devices you excluded excluded, and never overwrites a working network key or mesh ID with a blank one. Optional `config_entry_id` targets one account; omit it to refresh all. Manual, no background polling. For a UI equivalent with a device picker, use **Reconfigure** (below). |
 
 There are also debug-only services (`probe_status`, `probe_send`, `probe_magic`)
 used for protocol work — ignore them for normal use.
@@ -435,23 +448,59 @@ trapezoidal. The result carries `total_increasing` statistics for the
 Energy/history dashboards. Accuracy is good for steady irrigation; the only error
 source is flow variation *between* polls.
 
+## Reconfigure (adding a device you bought later)
+
+The device list is captured in the config entry at setup and is **not**
+refreshed by a reload or an HA restart, so a newly-purchased timer won't appear
+on its own. Adding the account a second time doesn't work either — the entry is
+keyed on your email, so the flow aborts with "already configured".
+
+Settings → Devices & Services → Orbit B-Hyve BLE → ⋮ → **Reconfigure**:
+
+1. Re-runs cloud discovery with the saved credentials. You're only prompted for
+   a password if Orbit rejects them
+2. Re-shows the device picker. **New devices are pre-checked**; devices you
+   excluded before stay unchecked
+3. Devices the cloud no longer returns are labelled *"no longer on the Orbit
+   account"* and stay pre-checked — they keep working over BLE. Uncheck one to
+   remove it and its entities. This is deliberate: cloud discovery skips
+   anything missing a `mesh_id`, so a partial response must not silently delete
+   a working device
+4. Submitting updates the entry and reloads it
+
+Two things worth knowing:
+
+- The **first** reconfigure of an entry created before this feature existed may
+  show previously-excluded devices as checked, because the old entry never
+  recorded which ones you excluded. Uncheck them once and the choice sticks.
+- Re-discovery never overwrites a working `network_key` or `hub_mesh_device_id`
+  with a blank cloud value. This matters if you rely on **Hub mesh ID
+  overrides** — a partial `/networks` response would otherwise drop the device
+  back to the `0x0000` placeholder and your watering commands would start
+  getting dropped with only a log warning to show for it.
+
 ## How it works
 
-1. **Setup (cloud, once):** sign in → fetch the device list → fetch one AES
-   network key per mesh → cache it all in the config entry. No cloud traffic after.
-2. **Connect-on-demand (ephemeral sessions):** for each command or poll the
-   integration opens a fresh BLE connection, runs the AES-128 handshake + per-model
-   init, sends the encrypted frame, reads the reply, then **cleanly disconnects**.
-   This avoids ESPHome-proxy slot starvation, keeps the crypto counter from going
-   stale, and spares batteries. Marginal links get a bounded handshake with a few
-   clean retries instead of a wedged connection.
-3. **Real state-sync (protobuf family):** each poll solicits the device's `#16`
+1. **Setup**: log into Orbit cloud at setup — and again only when you
+   reconfigure or call `refresh_devices` → fetch device list → fetch one AES
+   network key per mesh → cache everything in the config entry. No cloud
+   traffic otherwise.
+2. **Per command**: the integration's pooled BLE connection (one per device)
+   does an AES-128 handshake, runs the model-specific init sequence on first
+   connect, then sends one encrypted frame per command and reads back
+   notifications.
+3. **Reuse**: the connection stays open across commands until idle timeout.
+   Watering commands re-run the model init/bind first — the device silently
+   ignores a watering frame sent on a stale bind — while reads reuse the
+   pooled session directly. Marginal proxy links get a bounded handshake with
+   a few clean retries instead of a wedged connection.
+4. **Real state-sync (protobuf family):** each poll solicits the device's `#16`
    status and decodes run-state, active zone, seconds-remaining, battery,
    rain-delay, controller mode, and the next scheduled start — so HA reflects runs
    it didn't start (schedule / app / button) and auto-closes on the device's own
    timer. The poll doubles as a **clock-sync** (sets the device clock to HA time)
    so schedules fire at the right wall-clock hour.
-4. **Multi-frame reads:** a full schedule dump streams as many BLE frames; the
+5. **Multi-frame reads:** a full schedule dump streams as many BLE frames; the
    transport reassembles them, with a self-heal for counter desync and de-dup for
    proxy frame re-delivery.
 
@@ -504,9 +553,3 @@ analysis of the publicly distributed companion mobile application. The authors a
 not affiliated with Orbit Irrigation Products Inc.
 
 [MIT](LICENSE).
-
----
-
-Enjoy my work? Help me out for a couple of :beers: or a :coffee:!
-
-<a href="https://www.buymeacoffee.com/JMISm06AD"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="41" width="174"></a>
